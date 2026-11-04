@@ -4,7 +4,9 @@ dual_camera.py - Optris PI 640i (thermal) + MOKOSE UC50 (optical), both over USB
 Install once:  python -m pip install opencv-python numpy pygrabber
                plus the Optris thermal camera SDK (provides the Python module optris.otcsdk);
                restart the PC after installing it.
-Run:           python dual_camera.py          (q or Esc to quit, s = optical camera settings)
+Run:           python dual_camera.py          (q or Esc to quit, s = optical camera settings,
+                                               c = calibration picture: see calibrate_view)
+               python dual_camera.py calibration/<time>   (calibrate again from saved pictures)
 
 From your own code (images are plain OpenCV / NumPy arrays):
     from dual_camera import CameraRig
@@ -18,11 +20,12 @@ From your own code (images are plain OpenCV / NumPy arrays):
         pair.timestamp                          # time.time() when the pair was taken
         pair.temperature(x, y), pair.colour(x, y)   # at build plate point(s) x', y' in mm
 """
-import functools
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -50,33 +53,34 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 @dataclass(frozen=True)
 class View:
-    """How one camera sees the build plate: lens model plus mounting. The camera looks straight down.
+    """How one camera sees the print plane (the plane the checkerboard lay in for calibrate_view).
+    The camera looks straight down.
 
-    Lens: pinhole with field of view `fov` = (horizontal, vertical) deg, plus OpenCV lens distortion
-    `dist` = (k1, k2, p1, p2, k3); both come from calibrate_lens(). Principal point = picture centre.
-    Mounting: lens `height` mm above the plate, straight above the plate point `center` = (x', y') mm,
-    the picture's rightward direction at `omega` deg from +x' (counter-clockwise seen from above).
+    Zoom: `size` = (width, height) mm of the print plane area the picture shows, as it would be without
+    lens distortion. Lens distortion: OpenCV's `dist` = (k1, k2, p1, p2, k3) in plate mm from `center`
+    divided by half the width (1 = the picture's left/right edge). Both come from calibrate_view().
+    Mounting: the picture centre lies on the plate point `center` = (x', y') mm, the picture's rightward
+    direction at `omega` deg from +x' (counter-clockwise seen from above); both measured by hand.
     """
-    fov: tuple
-    height: float
+    size: tuple
     center: tuple
     omega: float = 0.0
     dist: tuple = (0.0, 0.0, 0.0, 0.0, 0.0)
 
-    def _intrinsics(self, shape):
+    def _camera_matrix(self, shape):
         h, w = shape[:2]
-        fx, fy = (n / 2 / np.tan(np.radians(a) / 2) for n, a in zip((w, h), self.fov))
-        return fx, fy, (w - 1) / 2, (h - 1) / 2
+        return np.array([[w / 2, 0, (w - 1) / 2], [0, h / 2 * self.size[0] / self.size[1], (h - 1) / 2], [0, 0, 1]])
 
     def to_pixel(self, x, y, shape):
         """Where build plate point(s) (x', y') mm appear in a picture of shape `shape`.
 
         Returns (u, v) = (column, row) as float arrays; NaN for points the lens model cannot map.
         """
-        fx, fy, cx, cy = self._intrinsics(shape)
+        (fx, _, cx), (_, fy, cy), _ = self._camera_matrix(shape)
         c, s = np.cos(np.radians(self.omega)), np.sin(np.radians(self.omega))
         dx, dy = np.asarray(x, float) - self.center[0], np.asarray(y, float) - self.center[1]
-        xn, yn = (dx * c + dy * s) / self.height, (dx * s - dy * c) / self.height   # ideal pinhole
+        half = self.size[0] / 2
+        xn, yn = (dx * c + dy * s) / half, (dx * s - dy * c) / half             # without distortion
         k1, k2, p1, p2, k3 = self.dist
         r2 = xn**2 + yn**2
         radial = 1 + k1 * r2 + k2 * r2**2 + k3 * r2**3
@@ -84,30 +88,32 @@ class View:
         yd = yn * radial + p1 * (r2 + 2 * yn**2) + 2 * p2 * xn * yn
         # Past the radius where the distortion polynomial stops growing it folds back and would put
         # far-away points inside the picture; those points are left out.
-        r2_test = np.linspace(0, 4 * np.sum(np.tan(np.radians(self.fov) / 2) ** 2), 1000)  # to 2x corner
+        r2_test = np.linspace(0, 4 * (1 + (self.size[1] / self.size[0]) ** 2), 1000)   # to 2x corner
         fold = 1 + 3 * k1 * r2_test + 5 * k2 * r2_test**2 + 7 * k3 * r2_test**3 <= 0
         ok = r2 < (r2_test[fold.argmax()] if fold.any() else r2_test[-1])
         return np.where(ok, fx * xd + cx, np.nan), np.where(ok, fy * yd + cy, np.nan)
 
     def to_plate(self, u, v, shape):
         """Build plate point(s) (x', y') mm seen at pixel (u, v) = (column, row) of a picture of shape `shape`."""
-        fx, fy, cx, cy = self._intrinsics(shape)
         u, v = np.broadcast_arrays(np.asarray(u, float), np.asarray(v, float))
         n = cv2.undistortPointsIter(np.stack([u.ravel(), v.ravel()], -1).reshape(-1, 1, 2),
-                                    np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]]), np.array(self.dist),
-                                    None, None, (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 50, 1e-12))
+                                    self._camera_matrix(shape), np.array(self.dist), None, None,
+                                    (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 50, 1e-12))
         xn, yn = n[:, 0, 0].reshape(u.shape), n[:, 0, 1].reshape(u.shape)
         c, s = np.cos(np.radians(self.omega)), np.sin(np.radians(self.omega))
-        return (self.center[0] + self.height * (xn * c + yn * s),
-                self.center[1] + self.height * (xn * s - yn * c))
+        half = self.size[0] / 2
+        return (self.center[0] + half * (xn * c + yn * s),
+                self.center[1] + half * (xn * s - yn * c))
 
 
 # Build plate frame x'-y': origin at the plate centre, mm, +x' right and +y' up seen from above.
-PLATE_R_INNER, PLATE_R_OUTER = 50, 200     # mm
-PLOT_SCALE = 2                             # pixels per mm in plot_radial
-# Placeholders until measured on the rig; fov and dist from calibrate_lens().
-OPTICAL_VIEW = View(fov=(24, 18), height=100, center=(-100, -80), omega=70)
-THERMAL_VIEW = View(fov=(50, 38), height=100, center=(-80, -100), omega=20)
+PLATE_R_INNER, PLATE_R_OUTER = 15, 100     # mm
+# Placeholders until measured on the rig: center and omega by hand, size and dist from
+# calibrate_view() (key c in the live view).
+OPTICAL_VIEW = View(size=(88.209, 66.02), center=(-56.46213605, 27.8451025), omega=320, dist=(-0.030203, 0.014376, 0.000732, 9.4e-05, -0.006925))
+THERMAL_VIEW = View(size=(115.5, 86.5), center=(-5.86124587, 57.00031636), omega=280)
+BOARD_SQUARE = 5.00                      # mm, side of one calibration checkerboard square
+CALIBRATION_DIR = Path(__file__).resolve().parent / "calibration"   # pictures taken with c
 
 
 def placeholder(title, size=(640, 480)):
@@ -309,104 +315,213 @@ class CameraRig:
         self.close()
 
 
-def calibrate_lens(pictures, board=(9, 6)):
-    """Lens field of view and distortion from pictures of a flat checkerboard.
+def calibrate_view(view, pictures, square=BOARD_SQUARE, marked=None):
+    """`view` with size and dist fitted to pictures of a flat checkerboard in the print plane.
 
-    `board` = inner corners (columns, rows). Use 10-20 pictures with the board at different places,
-    tilts and distances, together covering the whole picture, corners included. Pictures may be BGR
-    or 2D (e.g. pair.thermal_c; the thermal camera needs a board that shows up warm/cold).
-    Returns (fov, dist) for View(...).
+    The board must cover the picture centre and at least 40% of the picture, better all of it (the
+    distortion is only measured where there are corners); it may be larger than the picture, at any
+    rotation, and moved between pictures. `square` = side of one square in mm. center and omega are
+    kept: the board's place and rotation on the plate are not needed. Pictures may be BGR or 2D (e.g.
+    pair.thermal_c; the thermal camera needs a board that shows up warm/cold). Prints how well the
+    fitted view matches the corners. If `marked` is a list, one BGR picture per picture is appended
+    showing what was found: yellow = corner candidates, green = checkerboard corners and grid,
+    red = where the fitted view puts them, text = verdict.
     """
-    corners_board = np.zeros((board[0] * board[1], 3), np.float32)
-    corners_board[:, :2] = np.mgrid[:board[0], :board[1]].T.reshape(-1, 2)    # square size: irrelevant
-    found_board, found_pic = [], []
-    for pic in pictures:
+    def corner_near(gray, strong, peaks, guess, step):   # checkerboard corner refined from `guess`, or None
+        size = np.hypot(*step)                        # `step` = one square along a row or column, px
+        win = max(2, int(0.3 * size))                 # window stays inside the squares
+        near = peaks[np.hypot(*(peaks - guess).T).argmin()]
+        if np.hypot(*(near - guess)) < 0.4 * size:    # a predicted corner can be off by a third of a square
+            guess = near
+        h, w = gray.shape
+        if not (win <= guess[0] <= w - 1 - win and win <= guess[1] <= h - 1 - win):
+            return None
+        corner = cv2.cornerSubPix(gray, guess.astype(np.float32).reshape(1, 1, 2), (win, win), (-1, -1),
+                                  (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 40, 0.001))[0, 0]
+        # In a flat area cornerSubPix stays put, so also check there is a corner (not flat, not an edge).
+        if np.hypot(*(corner - guess)) >= 0.25 * size or not strong[round(corner[1]), round(corner[0])]:
+            return None
+        # And that it is a checkerboard corner (noise has corners too): of the four squares around it,
+        # the diagonal ones look alike and the neighbouring ones clearly different.
+        perp, k = np.array([-step[1], step[0]]), max(1, int(0.2 * size))
+        q = [cv2.getRectSubPix(gray, (k, k), tuple(map(float, corner + 0.25 * (i * step + j * perp)))).mean()
+             for i, j in ((1, 1), (-1, -1), (1, -1), (-1, 1))]
+        if abs(q[0] + q[1] - q[2] - q[3]) > max(2 * (abs(q[0] - q[1]) + abs(q[2] - q[3])), 20):
+            return corner.astype(float)
+        return None
+
+    def verdict(mark, number, text, ok=False):       # written onto the marked picture, printed if left out
+        line = max(1, round(mark.shape[1] / 640))
+        tw = cv2.getTextSize(text, FONT, 0.6 * line, line)[0][0]
+        cv2.rectangle(mark, (0, 0), (tw + 16 * line, 34 * line), (0, 0, 0), -1)
+        cv2.putText(mark, text, (8 * line, 24 * line), FONT, 0.6 * line, (0, 255, 0) if ok else (0, 0, 255), line)
+        if not ok:
+            print(f"Picture {number}: {text}")
+
+    boards, used = [], []                          # per picture: corners in board mm, in pixels; its mark
+    for number, pic in enumerate(pictures, 1):
         gray = pic if pic.ndim == 2 else cv2.cvtColor(pic, cv2.COLOR_BGR2GRAY)
-        if gray.dtype != np.uint8:
-            gray = cv2.normalize(np.nan_to_num(gray), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        ok, corners = cv2.findChessboardCorners(gray, board)
-        if ok:
-            corners = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1),
-                                       (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 30, 0.01))
-            found_board.append(corners_board)
-            found_pic.append(corners)
-    print(f"Checkerboard found in {len(found_pic)} of {len(pictures)} pictures")
-    if len(found_pic) < 5:
-        raise RuntimeError("Too few checkerboard pictures for a calibration")
-    h, w = gray.shape
-    guess = np.array([[w, 0, (w - 1) / 2], [0, w, (h - 1) / 2], [0, 0, 1]], float)  # centre as in View
-    err, k, dist, _, _ = cv2.calibrateCamera(found_board, found_pic, (w, h), guess, None,
-                                             flags=cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_PRINCIPAL_POINT)
-    fov = tuple(round(float(np.degrees(2 * np.arctan(n / 2 / f))), 3) for n, f in ((w, k[0, 0]), (h, k[1, 1])))
-    dist = tuple(round(float(d), 6) for d in dist.ravel()[:5])
-    print(f"fov={fov}, dist={dist}  (reprojection error {err:.2f} px)")
-    return fov, dist
+        if gray.dtype != np.uint8:                    # temperatures: 1%..99% -> 0..255, hot/cold spots clipped
+            lo, hi = np.nanpercentile(gray, (1, 99)) if np.isfinite(gray).any() else (0, 1)
+            gray = np.clip((np.nan_to_num(gray, nan=lo) - lo) * 255 / max(hi - lo, 1e-6), 0, 255).astype(np.uint8)
+        h, w = gray.shape
+        centre = np.array([(w - 1) / 2, (h - 1) / 2])
+        mark = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR) if pic.ndim == 2 else pic.copy()
+        line = max(1, round(w / 640))                 # line width in the marked picture
+        if marked is not None:
+            marked.append(mark)
+        # Corners are searched in the picture scaled to <= 800 px wide: in a sharp high-resolution
+        # picture paper texture and noise give many small corner features close together.
+        zoom = min(1.0, 800 / w)
+        small = cv2.resize(gray, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_AREA) if zoom < 1 else gray
+        # Square size from the strongest repetition in the picture centre (noise has none): a
+        # checkerboard's strongest Fourier component runs diagonally, with period sqrt(2) x square.
+        n = min(small.shape)
+        y0, x0 = (small.shape[0] - n) // 2, (small.shape[1] - n) // 2
+        crop = small[y0:y0 + n, x0:x0 + n].astype(np.float32)
+        crop = (crop - cv2.GaussianBlur(crop, (0, 0), n / 8)) * np.outer(np.hanning(n), np.hanning(n))
+        power = np.abs(np.fft.fft2(crop)) ** 2
+        freq = np.hypot(*np.meshgrid(np.fft.fftfreq(n), np.fft.fftfreq(n)))   # cycles per px
+        power[(freq < 4 / n) | (freq > 1 / 8)] = 0                            # periods 8 px .. n/4
+        size = 1 / freq.flat[power.argmax()] / np.sqrt(2)
+        # Smoothed by a tenth of a square (removes pixel noise, keeps the corners) and the contrast evened
+        # out over about a square (board warmer in one place than another, uneven light); the +2 grey
+        # levels keep areas without a board from being amplified to full contrast.
+        flat = cv2.GaussianBlur(small.astype(np.float32), (0, 0), 0.1 * size)
+        flat -= cv2.GaussianBlur(flat, (0, 0), size)
+        flat /= np.sqrt(cv2.GaussianBlur(flat * flat, (0, 0), size)) + 2
+        small = np.clip(128 + 60 * flat, 0, 255).astype(np.uint8)
+        # OpenCV's checkerboard detectors expect a border around the board and mis-number the corners
+        # of a board larger than the picture. So: a 2x2 block of corners at the picture centre (from
+        # the strongest corner features, one square apart), grown to the picture edges by
+        # predicting the next corner along a row or column from the last two and refining it.
+        # Candidates: saddle points of the smoothed picture. A checkerboard corner is one; the middle of a
+        # (blurred, e.g. thermal) square and a straight edge are not, unlike for usual corner detectors.
+        sm = cv2.GaussianBlur(small.astype(np.float32), (0, 0), 0.2 * size)
+        saddle = cv2.Sobel(sm, -1, 1, 1) ** 2 - cv2.Sobel(sm, -1, 2, 0) * cv2.Sobel(sm, -1, 0, 2)
+        sh, sw = small.shape
+        strong = saddle > 0.05 * saddle[sh // 4:-sh // 4, sw // 4:-sw // 4].max()   # board covers the centre
+        k = 2 * int(0.3 * size) + 1
+        peaks = np.argwhere(strong & (saddle == cv2.dilate(saddle, np.ones((k, k), np.uint8))))[:, ::-1].astype(float)
+        if len(peaks) < 9:
+            verdict(mark, number, f"left out: hardly any corner features (square ~{size / zoom:.0f} px)")
+            continue
+        pts = peaks[np.argsort(np.hypot(*(peaks - centre * zoom).T))[:100]]
+        for p in pts:
+            cv2.circle(mark, tuple(np.round(p / zoom).astype(int)), 3 * line, (0, 255, 255), line)
+        gaps = np.hypot(*(pts[:, None] - pts[None]).transpose(2, 0, 1))
+        np.fill_diagonal(gaps, np.inf)
+        found = None
+        for i in range(min(20, len(pts))):
+            a = pts[gaps[i].argmin()] - pts[i]            # one square along a row
+            if not 0.75 * size < np.hypot(*a) < 1.33 * size:
+                continue
+            b = np.array([-a[1], a[0]])                   # one square along a column
+            seed = {(r, c): corner_near(small, strong, peaks, pts[i] + c * a + r * b, a) for r in (0, 1) for c in (0, 1)}
+            if all(p is not None for p in seed.values()):
+                found = seed
+                break
+        if found is None:
+            verdict(mark, number, f"left out: no 2x2 checkerboard corners near the centre "
+                                  f"(square ~{size / zoom:.0f} px)")
+            continue
+        todo = list(found)
+        while todo:
+            r, c = todo.pop()
+            for dr, dc in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                new, back = (r + dr, c + dc), (r - dr, c - dc)
+                if new in found or back not in found:
+                    continue
+                step = found[r, c] - found[back]
+                corner = corner_near(small, strong, peaks, found[r, c] + step, step)
+                if corner is not None:
+                    found[new] = corner
+                    todo.append(new)
+        if zoom < 1:                                  # refine in the full picture
+            win = max(2, int(0.25 * size / zoom))
+            full = {rc: (p + 0.5) / zoom - 0.5 for rc, p in found.items()}
+            pix = cv2.cornerSubPix(gray, np.array(list(full.values()), np.float32).reshape(-1, 1, 2), (win, win),
+                                   (-1, -1), (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 40, 0.001))
+            found = {rc: p.astype(float) for (rc, guess), p in zip(full.items(), pix[:, 0])
+                     if np.hypot(*(p - guess)) < 2 / zoom}
+        for (r, c), p in found.items():
+            for n in ((r, c + 1), (r + 1, c)):
+                if n in found:
+                    cv2.line(mark, tuple(np.round(p).astype(int)), tuple(np.round(found[n]).astype(int)),
+                             (0, 255, 0), line)
+            cv2.circle(mark, tuple(np.round(p).astype(int)), 4 * line, (0, 255, 0), -1)
+        pix = np.array(list(found.values()))
+        spread = cv2.contourArea(cv2.convexHull(pix.astype(np.float32))) / (w * h)
+        if spread < 0.4:                              # the board fills the picture; this is something else
+            verdict(mark, number, f"left out: {len(pix)} corners cover only {spread:.0%} of it "
+                                  f"(square ~{size / zoom:.0f} px)")
+            continue
+        verdict(mark, number, f"{len(pix)} corners, cover {spread:.0%}, square ~{size / zoom:.0f} px", ok=True)
+        # Board frame: x along the rows; the columns run 90 deg clockwise of that in the picture,
+        # which is -y seen from above.
+        rc = np.array(list(found), float)
+        boards.append((np.stack([rc[:, 1], -rc[:, 0]], 1) * square, pix))
+        used.append(mark)
+    print(f"Checkerboard found in {len(boards)} of {len(pictures)} pictures")
+    if not boards:
+        raise RuntimeError("No checkerboard found, nothing calibrated")
 
+    # Fit one lens to all pictures, each with its own board position and rotation (picture centre in
+    # board mm, omega from the board's x), by Levenberg-Marquardt on the corner positions in pixels.
+    start = [0.0] * 7                                 # size in mm (width, height), k1, k2, p1, p2, k3
+    for xy, pix in boards:                            # first guess from a homography (no distortion)
+        hom = cv2.findHomography(xy, pix)[0]
+        c = cv2.perspectiveTransform(centre.reshape(1, 1, 2), np.linalg.inv(hom))[0, 0]
+        d = np.diff(cv2.perspectiveTransform(np.array([[c, c + (1, 0)]]), hom)[0], axis=0)[0]   # 1 mm along x
+        start[0], start[1] = w / np.hypot(*d), h / np.hypot(*d)
+        start += [c[0], c[1], np.degrees(np.arctan2(d[1], d[0]))]
 
-@functools.lru_cache(maxsize=8)
-def _plate_view(view, shape, n, half, scale):
-    """Which pixels of the plot_radial canvas a camera sees, and where they are in its picture."""
-    rows, cols = np.mgrid[:n, :n]
-    u, v = view.to_pixel(cols / scale - half, half - rows / scale, shape)
-    h, w = shape[:2]
-    seen = (u >= 0) & (u <= w - 1) & (v >= 0) & (v <= h - 1)
-    outline = cv2.findContours(seen.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
-    return seen, u[seen], v[seen], outline
+    def errors(p):                                    # fitted minus found corner positions, px, (n, 2)
+        return np.concatenate([
+            np.subtract(View(tuple(p[:2]), (cx, cy), om, tuple(p[2:7])).to_pixel(*xy.T, (h, w)), pix.T).T
+            for (xy, pix), (cx, cy, om) in zip(boards, p[7:].reshape(-1, 3))])
 
+    def fit(p):
+        e, damping = errors(p).ravel(), 1e-3
+        for _ in range(200):
+            jac = np.empty((e.size, p.size))
+            for k in range(p.size):
+                dp = np.zeros_like(p)
+                dp[k] = 1e-6 * max(1.0, abs(p[k]))
+                jac[:, k] = (errors(p + dp).ravel() - e) / dp[k]
+            a, g = jac.T @ jac, jac.T @ e
+            while damping < 1e8:
+                p_new = p - np.linalg.solve(a + damping * np.diag(np.diag(a)), g)
+                e_new = errors(p_new).ravel()
+                if e_new @ e_new < e @ e:             # False for NaN (lens model folded back)
+                    break
+                damping *= 10
+            else:
+                break
+            done = e @ e - e_new @ e_new < 1e-10 * (e @ e)
+            p, e, damping = p_new, e_new, damping / 10
+            if done:
+                break
+        return p, np.hypot(*e.reshape(-1, 2).T)
 
-def plot_radial(pair, scale=PLOT_SCALE):
-    """Build plate from above with a radial grid and both camera views where they really are.
-
-    Each canvas pixel is looked up in the original pictures (lens distortion and omega included).
-    Returns a BGR picture, `scale` pixels per mm, plate centre in the middle, +x' right, +y' up.
-    """
-    half = PLATE_R_OUTER + 25                      # mm from the plate centre to the picture edge
-    n = round(2 * half * scale)
-
-    def px(x, y):                                  # build plate mm -> canvas pixel
-        return round((x + half) * scale), round((half - y) * scale)
-
-    canvas = np.full((n, n, 3), 255, np.uint8)
-    cv2.circle(canvas, px(0, 0), round(PLATE_R_OUTER * scale), (225, 225, 225), -1, cv2.LINE_AA)
-    cv2.circle(canvas, px(0, 0), round(PLATE_R_INNER * scale), (255, 255, 255), -1, cv2.LINE_AA)
-
-    views = (("thermal", (0, 0, 255), _plate_view(THERMAL_VIEW, pair.thermal.shape, n, half, scale)),
-             ("optical", (255, 0, 0), _plate_view(OPTICAL_VIEW, pair.optical.shape, n, half, scale)))
-    for (_, _, (seen, u, v, _)), img in zip(views, (pair.thermal, pair.optical)):   # optical on top
-        canvas[seen] = np.round(_sample(img, u, v)).astype(np.uint8)
-
-    # Grid as an opacity mask, blended over everything in black or white, whichever shows up.
-    grid = np.zeros((n, n), np.uint8)
-    for step_r, step_deg, opacity in ((10, 10, 70), (50, 30, 230)):           # minor, then major
-        for r in range(PLATE_R_INNER, PLATE_R_OUTER + 1, step_r):
-            cv2.circle(grid, px(0, 0), round(r * scale), opacity, 1, cv2.LINE_AA)
-        for deg in range(0, 360, step_deg):
-            c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
-            cv2.line(grid, px(PLATE_R_INNER * c, PLATE_R_INNER * s),
-                     px(PLATE_R_OUTER * c, PLATE_R_OUTER * s), opacity, 1, cv2.LINE_AA)
-    on = grid > 0
-    opacity = grid[on, None] / 255
-    contrast = np.where(canvas[on].mean(axis=1, keepdims=True) < 110, 255, 0)
-    canvas[on] = canvas[on] * (1 - opacity) + contrast * opacity
-
-    for r in range(PLATE_R_INNER, PLATE_R_OUTER + 1, 50):
-        u, v = px(r, 0)
-        tw = cv2.getTextSize(str(r), FONT, 0.4, 1)[0][0]
-        cv2.putText(canvas, str(r), (u - tw - 3, v - 4), FONT, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
-    for deg in range(0, 360, 30):
-        text = f"{deg}" + {0: " x'", 90: " y'"}.get(deg, "")
-        tw, th = cv2.getTextSize(text, FONT, 0.4, 1)[0]
-        r = PLATE_R_OUTER + 12
-        u, v = px(r * np.cos(np.radians(deg)), r * np.sin(np.radians(deg)))
-        cv2.putText(canvas, text, (u - tw // 2, v + th // 2), FONT, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
-    for name, colour, (_, _, _, outline) in views:
-        if outline:
-            cv2.polylines(canvas, outline, True, colour, 1, cv2.LINE_AA)
-            points = np.vstack(outline)[:, 0]
-            u, v = points[points[:, 1].argmin()]                                   # top of the view
-            tw = cv2.getTextSize(name, FONT, 0.4, 1)[0][0]
-            cv2.putText(canvas, name, (int(u) - tw // 2, int(v) - 6), FONT, 0.4, colour, 1, cv2.LINE_AA)
-    return canvas
+    p, err = fit(np.array(start))
+    keep = err < max(1.0, 5 * np.median(err))         # drop mis-found corners (glare, dirt) and refit
+    if not keep.all():
+        keep = np.split(keep, np.cumsum([len(xy) for xy, _ in boards])[:-1])
+        boards = [(xy[k], pix[k]) for (xy, pix), k in zip(boards, keep)]
+        p, err = fit(p)
+    fitted = errors(p) + np.vstack([pix for _, pix in boards])
+    line = max(1, round(w / 640))
+    for (_, pix), mark, at in zip(boards, used, np.split(fitted, np.cumsum([len(pix) for _, pix in boards])[:-1])):
+        for u, v in at[np.isfinite(at).all(1)]:
+            cv2.drawMarker(mark, (round(u), round(v)), (0, 0, 255), cv2.MARKER_CROSS, 10 * line, line)
+    off = np.vstack([pix for _, pix in boards]) - centre
+    quadrant = (off[:, 0] > 0) * 2 + (off[:, 1] > 0)
+    reach = min(np.hypot(*off[quadrant == q].T).max(initial=0) for q in range(4)) / np.hypot(*centre)
+    rms = np.sqrt(np.mean(err**2))
+    print(f"{len(err)} corners, error rms {rms:.2f} px = {rms * p[0] / w:.3f} mm, max {err.max():.2f} px; "
+          f"corners reach {reach:.0%} of the way to the picture corners")
+    return replace(view, size=tuple(round(float(s), 3) for s in p[:2]), dist=tuple(round(float(d), 6) for d in p[2:7]))
 
 
 def side_by_side(pair):
@@ -432,19 +547,55 @@ def side_by_side(pair):
     return np.hstack(panels)
 
 
+def calibrate_both(folder):
+    """Calibrate both views from the pictures in `folder` (thermal_<n>.npy = thermal_c, optical_<n>.png)
+    and print View lines to paste in. Writes <name>_<n>_corners.png next to them: what was found."""
+    for name, view, kind, load in (("THERMAL_VIEW", THERMAL_VIEW, "thermal", "npy"),
+                                   ("OPTICAL_VIEW", OPTICAL_VIEW, "optical", "png")):
+        files = sorted((f for f in folder.glob(f"{kind}_*.{load}") if f.stem[len(kind) + 1:].isdigit()),
+                       key=lambda f: int(f.stem[len(kind) + 1:]))     # not the *_corners.png ones
+        if not files:
+            continue
+        pictures = [np.load(f) if load == "npy" else cv2.imread(str(f)) for f in files]
+        print(f"\n{name} calibration ({', '.join(f.name for f in files)}):")
+        marked = []
+        try:
+            print(f"{name} = {calibrate_view(view, pictures, marked=marked)}")
+        except RuntimeError as exc:
+            print(exc)
+        for f, mark in zip(files, marked):
+            cv2.imwrite(str(f.with_name(f"{f.stem}_corners.png")), mark)
+        print(f"Corners found: {folder / kind}_<n>_corners.png")
+
+
 def main():
+    if len(sys.argv) > 1:                             # python dual_camera.py calibration/<time>
+        calibrate_both(Path(sys.argv[1]))
+        return
     window = "Thermal | Optical"
+    folder = CALIBRATION_DIR / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    taken = 0                                         # calibration pairs, taken with c
     with CameraRig() as rig:
         while True:
             pair = rig.grab()
             cv2.imshow(window, side_by_side(pair))
-            cv2.imshow("Build plate", plot_radial(pair))
             key = cv2.waitKey(1 if pair.optical_live else 30) & 0xFF
             if key == ord("s"):
                 rig.optical_settings()
+            if key == ord("c"):
+                taken += 1
+                folder.mkdir(parents=True, exist_ok=True)
+                if pair.thermal_live:
+                    np.save(folder / f"thermal_{taken}.npy", pair.thermal_c)
+                    cv2.imwrite(str(folder / f"thermal_{taken}_colour.png"), pair.thermal)
+                if pair.optical_live:
+                    cv2.imwrite(str(folder / f"optical_{taken}.png"), pair.optical)
+                print(f"Calibration picture {taken} saved in {folder}")
             if key in (27, ord("q")) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
                 break
     cv2.destroyAllWindows()
+    if taken:
+        calibrate_both(folder)
 
 
 if __name__ == "__main__":

@@ -312,13 +312,15 @@ class CameraRig:
 
         self.thermal = None
         if otc is None:
-            print(f"Thermal camera: Optris SDK not available ({_OTC_ERROR}); showing placeholder")
+            print(f"Thermal camera: this Python ({sys.executable}, {sys.version.split()[0]}) cannot load the "
+                  f"Optris SDK ({_OTC_ERROR}); showing placeholder")
         else:
             try:
                 otc.Sdk.init(otc.Verbosity_Info, otc.Verbosity_Off, sys.argv[0])
                 self.thermal = Thermal()
             except Exception as exc:                # no camera plugged in, or it is in use
-                print(f"Thermal camera not available ({exc!r}); showing placeholder")
+                print(f"Thermal camera not available ({exc!r}; the SDK's own messages are in the terminal); "
+                      "showing placeholder")
 
         self.optical = None
         devices = video_devices()

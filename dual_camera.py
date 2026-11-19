@@ -1,9 +1,11 @@
 """
-dual_camera.py - Optris PI 640i (thermal) + MOKOSE UC50 (optical), both over USB, Windows only.
+dual_camera.py - Optris PI 640i (thermal) + MOKOSE UC50 (optical), both over USB, Windows or Linux (Ubuntu).
 
-Install once:  python -m pip install opencv-python numpy pygrabber
+Install once:  Windows: python -m pip install opencv-python numpy matplotlib pygrabber
+               Linux:   sudo apt install python3-numpy python3-opencv python3-matplotlib python3-tk
+                        x11-xserver-utils qv4l2   (the system Python: the Optris SDK is built for its NumPy)
                plus the Optris thermal camera SDK (provides the Python module optris.otcsdk);
-               restart the PC after installing it.
+               Windows: restart the PC after installing it.
 Run:           python app.py                  (the GUI: live view, recording, build plate, calibration)
                python dual_camera.py          (q or Esc to quit, s = optical camera settings,
                                                c = calibration picture: see calibrate_view)
@@ -25,6 +27,9 @@ From your own code (images are plain OpenCV / NumPy arrays):
     save_pair(pair) -> pictures/<time>.png,  load_pair(path) -> the FramePair again (no cameras needed)
 """
 import json
+import math
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -34,20 +39,23 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from pygrabber.dshow_graph import FilterGraph
+
+WINDOWS = sys.platform == "win32"   # else Linux: V4L2 instead of DirectShow for the optical camera
+if WINDOWS:
+    from pygrabber.dshow_graph import FilterGraph
 
 try:
     import optris.otcsdk as otc
     _OTC_ERROR = None
-except ImportError as exc:     # SDK not installed, or the PC was not restarted after installing it
-    otc, _OTC_ERROR = None, exc
+except ImportError as exc:     # SDK not installed, Windows: the PC was not restarted after installing it,
+    otc, _OTC_ERROR = None, exc    # Linux: the SDK was built for another Python / NumPy than this one
 
-OPTICAL_NAME = "uc50"          # as Windows lists it (case-insensitive; part of the name is enough)
+OPTICAL_NAME = "uc50"          # as Windows / Linux list it (case-insensitive; part of the name is enough)
 OPTICAL_SIZE = (2048, 1536)    # requested resolution, None = camera default (actual size is printed)
                                # UC50: 2048x1536 gives 2.5 frames/s, 1600x1200 4, 1024x768 and 800x600 30
 # Webcams have no ISO; gain is the equivalent. The camera only follows OPTICAL_GAIN with manual
-# exposure, so set both. None = automatic. Exposure is 2**value s: -5 = 1/32 s (longest for 30 frames/s),
-# -7 = 1/128 s. Press s in the live view to open the camera's own settings window to try values.
+# exposure, so set both. None = automatic. Exposure in s, e.g. 1/32 (longest for 30 frames/s) or 1/128
+# (Windows rounds it to a power of 2). Press s in the live view to open the camera's own settings to try values.
 OPTICAL_EXPOSURE = None
 OPTICAL_GAIN = None            # UC50 accepted 0 to 30, rejected 100
 ROTATE_180 = True              # turn both camera pictures upside down (cameras mounted upside down)
@@ -270,6 +278,22 @@ class Thermal(otc.IRImagerClient if otc else object):
         self._imager.removeClient(self)
 
 
+def video_devices():
+    """(OpenCV index, name) of the video cameras. Windows: DirectShow's list, same order as OpenCV's
+    indices. Linux: /dev/video<n> with its name from sysfs; a USB camera also has a metadata node, left
+    out (its index within the camera is not 0)."""
+    if WINDOWS:
+        return list(enumerate(FilterGraph().get_input_devices()))
+    found = []
+    for node in Path("/sys/class/video4linux").glob("video*"):
+        try:
+            if int((node / "index").read_text()) == 0:
+                found.append((int(node.name[5:]), (node / "name").read_text().strip()))
+        except (OSError, ValueError):
+            pass
+    return sorted(found)
+
+
 class CameraRig:
     """Works with either camera, both, or neither connected."""
 
@@ -288,18 +312,23 @@ class CameraRig:
                 print(f"Thermal camera not available ({exc!r}); showing placeholder")
 
         self.optical = None
-        names = FilterGraph().get_input_devices()    # same order as OpenCV's DirectShow indices
-        index = next((i for i, n in enumerate(names) if OPTICAL_NAME in n.lower()), None)
+        devices = video_devices()
+        index = next((i for i, n in devices if OPTICAL_NAME in n.lower()), None)
         if index is None:
-            print(f"Optical camera '{OPTICAL_NAME}' not found. Cameras seen: {names}")
+            print(f"Optical camera '{OPTICAL_NAME}' not found. Cameras seen: {[n for _, n in devices]}")
             return
-        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        self.optical_index = index
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if WINDOWS else cv2.CAP_V4L2)
         if OPTICAL_SIZE:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # needed for 3MP over USB 2.0
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, OPTICAL_SIZE[0])
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, OPTICAL_SIZE[1])
         if OPTICAL_EXPOSURE is not None:
-            cap.set(cv2.CAP_PROP_EXPOSURE, OPTICAL_EXPOSURE)   # also switches auto exposure off
+            if WINDOWS:     # DirectShow: 2**value s; setting it also switches auto exposure off
+                cap.set(cv2.CAP_PROP_EXPOSURE, round(math.log2(OPTICAL_EXPOSURE)))
+            else:           # V4L2: auto exposure off first (1 = manual, 3 = auto), then in units of 100 us
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                cap.set(cv2.CAP_PROP_EXPOSURE, round(OPTICAL_EXPOSURE * 1e4))
         if OPTICAL_GAIN is not None:
             cap.set(cv2.CAP_PROP_GAIN, OPTICAL_GAIN)
         good, end = 0, time.monotonic() + 3          # first frames can fail; skip a few so exposure settles
@@ -307,12 +336,15 @@ class CameraRig:
             good += cap.read()[0]
         if good:
             self.optical = cap
-            print(f"Optical camera: index {index}, "
+            exposure = cap.get(cv2.CAP_PROP_EXPOSURE)
+            print(f"Optical camera: {'index ' if WINDOWS else '/dev/video'}{index}, "
                   f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}, "
-                  f"exposure {cap.get(cv2.CAP_PROP_EXPOSURE)}, gain {cap.get(cv2.CAP_PROP_GAIN)}")
+                  f"exposure {(2 ** exposure if WINDOWS else exposure / 1e4) * 1000:.3g} ms, "
+                  f"gain {cap.get(cv2.CAP_PROP_GAIN)}")
         else:
             cap.release()
-            print("Optical camera found but delivers no frames (is the Windows Camera app still open?)")
+            print("Optical camera found but delivers no frames (is another program using it, "
+                  f"{'the Windows Camera app' if WINDOWS else 'e.g. cheese or guvcview'}?)")
 
     def grab(self) -> FramePair:
         """Latest image from each camera. A missing or failed camera gives a placeholder."""
@@ -343,9 +375,20 @@ class CameraRig:
         )
 
     def optical_settings(self):
-        """Open the optical camera's own settings window (exposure, gain, auto on/off, ...)."""
-        if self.optical is not None:
+        """Open the optical camera's own settings window (exposure, gain, auto on/off, ...). Windows: the
+        driver's dialog, returns when it is closed. Linux: qv4l2 (or guvcview's control panel) as a program
+        of its own, returns at once: V4L2 lets another program change the settings while this one streams."""
+        if self.optical is None:
+            return
+        if WINDOWS:
             self.optical.set(cv2.CAP_PROP_SETTINGS, 1)
+            return
+        device = f"/dev/video{self.optical_index}"
+        for command in (["qv4l2", "-d", device], ["guvcview", "-d", device, "-z"]):
+            if shutil.which(command[0]):
+                subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+        print(f"No camera settings program: sudo apt install qv4l2 (or set them with v4l2-ctl -d {device})")
 
     def close(self):
         if self.optical is not None:

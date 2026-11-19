@@ -2,7 +2,7 @@
 app.py - the GUI: live view of both cameras, pictures, video recording, build plate view, calibration
 and alignment.
 
-Run:  python app.py
+Run:  python app.py        (Windows or Linux; what to install: see dual_camera.py)
 Main window: live thermal | optical view. Take a picture (p) into pictures/ (see dual_camera.save_pair),
 record a real-time clip (r) or a timelapse (t) as MP4 in clips/ (see capture_dual_video.py), show the
 current moment on the build plate (space, see plate_plot.py), open the optical camera's own settings
@@ -22,10 +22,12 @@ Looks like the RAPTURE machine interface (the AMCF web client with its RAPTURE t
 window has the same tab bar (Live, Calibration, Alignment, Areas) and state chips for the cameras.
 """
 import base64
+import functools
 import json
 import queue
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -76,9 +78,13 @@ def amcf_theme(root):
     """Style all windows of the app like the AMCF interface: ttk's "clam" theme recoloured (the native
     Windows theme ignores colours), rounded cards, buttons and chips from 9-slice images (`rounded`),
     Segoe UI, the RAPTURE rings as window icon."""
-    families = tkfont.families(root)
-    family = "Segoe UI" if "Segoe UI" in families else "Roboto"
-    semibold = "Segoe UI Semibold" if "Segoe UI Semibold" in families else family
+    families = set(tkfont.families(root))           # as rapture.css; Linux: the desktop's own sans
+    family = next((f for f in ("Segoe UI", "Roboto", "Arial", "Ubuntu Sans", "Noto Sans", "DejaVu Sans")
+                   if f in families), "Helvetica")
+
+    def bold(size):                                # Tk elsewhere knows only normal and bold
+        return ("Segoe UI Semibold", size) if "Segoe UI Semibold" in families else (family, size, "bold")
+
     unit = root.winfo_fpixels("1i") / 96           # screen px per px at 100% scaling
 
     def px(n):
@@ -112,8 +118,8 @@ def amcf_theme(root):
     style.configure("Tabs.TFrame", background=CARD)
     style.configure("Tab.TLabel", background=CARD, foreground=MUTED, font=(family, 11))
     style.configure("TabHover.TLabel", background=CARD, foreground=TEXT, font=(family, 11))
-    style.configure("TabActive.TLabel", background=CARD, foreground=TEAL, font=(semibold, 11))
-    style.configure("Title.TLabel", foreground=TEXT, font=(semibold, 13))
+    style.configure("TabActive.TLabel", background=CARD, foreground=TEAL, font=bold(11))
+    style.configure("Title.TLabel", foreground=TEXT, font=bold(13))
     style.configure("Muted.TLabel", foreground=MUTED, font=(family, 9))
     style.configure("Warn.TLabel", foreground=WARN)
     # State chips in the control bar: pills, white text, colour by state (CHIPS)
@@ -121,7 +127,7 @@ def amcf_theme(root):
         element(f"Chip{kind}.bg", px(14), [("", colour, colour)])
         style.layout(f"Chip{kind}.TLabel", [(f"Chip{kind}.bg", {"sticky": "nsew", "children": [
             ("Label.padding", {"sticky": "nsew", "children": [("Label.label", {"sticky": "nsew"})]})]})])
-        style.configure(f"Chip{kind}.TLabel", background=NAVY, foreground="white", font=(semibold, 9),
+        style.configure(f"Chip{kind}.TLabel", background=NAVY, foreground="white", font=bold(9),
                         padding=(px(14), px(5)), anchor="center")
     # Buttons: outlined teal; one filled main action per window; filled red to stop a recording; red outline to
     # delete; minor actions as teal text. Rounded 8 px; disabled grey.
@@ -135,7 +141,7 @@ def amcf_theme(root):
         element(f"{name}.bg", px(8), [("", *normal), disabled, ("pressed", *down), ("active", *hover)])
         style.layout(name, [(f"{name}.bg", {"sticky": "nsew", "children": [
             ("Button.padding", {"sticky": "nsew", "children": [("Button.label", {"sticky": "nsew"})]})]})])
-        style.configure(name, background=CARD, foreground=text, font=(semibold, 10), padding=(px(16), px(9)),
+        style.configure(name, background=CARD, foreground=text, font=bold(10), padding=(px(16), px(9)),
                         anchor="center")
         style.map(name, foreground=[("disabled", FAINT)],              # background = the corners
                   background=[("disabled", CARD), ("pressed", CARD), ("active", CARD)])
@@ -145,7 +151,7 @@ def amcf_theme(root):
         element(f"{name}.bg", px(17), states)
         style.layout(name, [(f"{name}.bg", {"sticky": "nsew", "children": [
             ("Button.padding", {"sticky": "nsew", "children": [("Button.label", {"sticky": "nsew"})]})]})])
-        style.configure(name, background=PAGE, foreground=text, font=(semibold, 10), padding=(px(22), px(7)),
+        style.configure(name, background=PAGE, foreground=text, font=bold(10), padding=(px(22), px(7)),
                         anchor="center")
         style.map(name, background=[("active", PAGE), ("pressed", PAGE)])
     style.configure("TEntry", fieldbackground="white", bordercolor=BORDER, lightcolor="white",
@@ -160,7 +166,7 @@ def amcf_theme(root):
     style.configure("Treeview", background="white", fieldbackground="white", bordercolor=BORDER,
                     lightcolor="white", darkcolor="white", rowheight=px(26), font=(family, 10))
     style.map("Treeview", background=[("selected", TEAL_SOFT)], foreground=[("selected", TEXT)])
-    style.configure("Treeview.Heading", background=NAVY, foreground="white", font=(semibold, 9), relief="flat",
+    style.configure("Treeview.Heading", background=NAVY, foreground="white", font=bold(9), relief="flat",
                     bordercolor=NAVY, lightcolor=NAVY, darkcolor=NAVY, padding=(px(6), px(4)))
     style.map("Treeview.Heading", background=[("active", "#1F2937")])
     style.configure("Horizontal.TScale", background=TEAL, troughcolor=OFF, bordercolor=OFF,
@@ -290,14 +296,41 @@ def area_size(widget, default):
     return (w, h) if w > 20 and h > 20 else default
 
 
+def x11(*command):
+    """Output of an X11 tool (Linux), '' on Windows or when the tool is missing."""
+    if sys.platform == "win32":
+        return ""
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+@functools.cache
+def monitor():
+    """Linux: (x, y, width, height) of the primary monitor (else the first) from xrandr, None if unknown.
+    Tk sees all monitors there as one wide screen (on Windows its screen is the main monitor)."""
+    found = re.findall(r"^\s*\d+:\s+\+?(\*?)\S+\s+(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)",
+                       x11("xrandr", "--listmonitors"), re.MULTILINE)
+    if not found:
+        return None
+    _, w, h, x, y = max(found, key=lambda m: m[0])     # "*" = primary
+    return int(x), int(y), int(w), int(h)
+
+
+def screen(win):
+    """(x, y, width, height) of the screen the windows go on."""
+    return monitor() or (0, 0, win.winfo_screenwidth(), win.winfo_screenheight())
+
+
 def fit_to_screen(win, size=None):
     """Fix the window's size (so it does not jump when a text changes): `size` or the size it asks for,
     at most 95% x 85% of the screen, near the top. Too big: the widget packed last (the picture) gives way."""
     win.update_idletasks()
-    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    sx, sy, sw, sh = screen(win)
     w, h = size or (win.winfo_reqwidth(), win.winfo_reqheight())
     w, h = min(w, int(sw * 0.95)), min(h, int(sh * 0.85))
-    win.geometry(f"{w}x{h}+{(sw - w) // 2}+{int(sh * 0.03)}")
+    win.geometry(f"{w}x{h}+{sx + (sw - w) // 2}+{sy + int(sh * 0.03)}")
 
 
 def view_source(camera):
@@ -577,12 +610,13 @@ class App:
         plot_tools(canvas, win).pack(side="bottom", fill="x")   # zoom / pan; x', y', r, angle, deg C under the mouse
         canvas.get_tk_widget().pack(fill="both", expand=True)
         draw_plate(fig, pair, layers)
-        fit_to_screen(win, (int(win.winfo_screenheight() * 0.8),) * 2)    # square, as the plate
+        fit_to_screen(win, (int(screen(win)[3] * 0.8),) * 2)    # square, as the plate
         canvas.draw()
         canvas.get_tk_widget().focus_set()         # space switches which camera lies on top
 
     def optical_settings(self):
-        print("Optical camera settings window: the live view pauses until it is closed")
+        if dual_camera.WINDOWS:                  # Linux: a program of its own, the live view keeps running
+            print("Optical camera settings window: the live view pauses until it is closed")
         self.cams.jobs.put(lambda rig: rig.optical_settings())
 
     def open_calibration(self):
@@ -686,7 +720,7 @@ class Calibration:
         ttk.Button(nav, text="◀", width=3, style="Minor.TButton", command=lambda: self.step(-1)).pack(side="left")
         ttk.Button(nav, text="▶", width=3, style="Minor.TButton", command=lambda: self.step(1)).pack(side="left")
         ttk.Button(nav, text="Delete this picture", style="Delete.TButton", command=self.delete).pack(side="right")
-        width = int(win.winfo_screenwidth() * PICTURE_SHARE)
+        width = int(screen(win)[2] * PICTURE_SHARE)
         self.picture_size = (width, width * 3 // 4)       # 4:3 like both cameras
         self.picture_area = ttk.Frame(viewer, width=self.picture_size[0], height=self.picture_size[1])
         self.picture_area.pack(fill="both", expand=True)
@@ -1008,7 +1042,7 @@ class Alignment:
                             ("<Escape>", lambda: self.table.selection_set(()))):
             win.bind(key, lambda event, action=action: isinstance(event.widget, tk.Entry) or action())
         win.protocol("WM_DELETE_WINDOW", self.close)
-        fit_to_screen(win, (win.winfo_screenwidth(), win.winfo_screenheight()))    # as large as it may be
+        fit_to_screen(win, screen(win)[2:])    # as large as it may be
         print("Alignment: take a picture (p) of things both cameras see where their pictures overlap (dashed "
               "outline), e.g. small warm objects with sharp edges. Click a feature in the thermal picture, then "
               "the same one in the optical picture; 3 or more points, spread out, then Fit (f). Zoom in with the "
@@ -1455,7 +1489,7 @@ class Areas:
         win.bind("<Return>", lambda _: self.finish())
         win.bind("<Escape>", lambda _: self.cancel())
         win.protocol("WM_DELETE_WINDOW", self.close)
-        fit_to_screen(win, (win.winfo_screenwidth(), win.winfo_screenheight()))    # as large as it may be
+        fit_to_screen(win, screen(win)[2:])    # as large as it may be
         print("Areas: New area (n), click the corners of the area on the build plate (or type them; 2 corners = a "
               "rectangle), Enter. Take picture (p) or Record every puts the moment into every area, resampled into "
               "plate mm (lens distortion taken out), thermal as deg C. Click an area on the plate to see its "
@@ -1897,6 +1931,9 @@ def main():
     except (AttributeError, OSError):
         pass
     root = tk.Tk()
+    dpi = re.search(r"^Xft\.dpi:\s*([\d.]+)", x11("xrdb", "-query"), re.MULTILINE)
+    if dpi:          # Linux: Tk ignores the desktop's display scaling; GNOME and KDE give it as Xft.dpi (96 = 100%)
+        root.tk.call("tk", "scaling", float(dpi.group(1)) / 72)    # fonts and amcf_theme's `unit` follow it
     amcf_theme(root)
     App(root)
     root.mainloop()

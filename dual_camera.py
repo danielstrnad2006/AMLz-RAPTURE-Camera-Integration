@@ -4,9 +4,11 @@ dual_camera.py - Optris PI 640i (thermal) + MOKOSE UC50 (optical), both over USB
 Install once:  python -m pip install opencv-python numpy pygrabber
                plus the Optris thermal camera SDK (provides the Python module optris.otcsdk);
                restart the PC after installing it.
-Run:           python dual_camera.py          (q or Esc to quit, s = optical camera settings,
+Run:           python app.py                  (the GUI: live view, recording, build plate, calibration)
+               python dual_camera.py          (q or Esc to quit, s = optical camera settings,
                                                c = calibration picture: see calibrate_view)
-               python dual_camera.py calibration/<time>   (calibrate again from saved pictures)
+               python dual_camera.py calibration/<time> [square mm]   (calibrate again from saved pictures)
+The camera views in use (build plate mapping) are stored in views/thermal.json and views/optical.json.
 
 From your own code (images are plain OpenCV / NumPy arrays):
     from dual_camera import CameraRig
@@ -18,12 +20,15 @@ From your own code (images are plain OpenCV / NumPy arrays):
         pair.optical      # BGR uint8
         pair.thermal_live, pair.optical_live    # False for placeholder pictures
         pair.timestamp                          # time.time() when the pair was taken
+        pair.rotation                           # deg the build plate had turned then (0 until the PLC tells)
         pair.temperature(x, y), pair.colour(x, y)   # at build plate point(s) x', y' in mm
+    save_pair(pair) -> pictures/<time>.png,  load_pair(path) -> the FramePair again (no cameras needed)
 """
+import json
 import sys
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -106,14 +111,50 @@ class View:
                 self.center[1] + half * (xn * s - yn * c))
 
 
-# Build plate frame x'-y': origin at the plate centre, mm, +x' right and +y' up seen from above.
+def read_view(path):
+    """(View, everything else stored with it, e.g. the calibration report) from a JSON file of save_view."""
+    d = json.loads(Path(path).read_text(encoding="utf-8"))
+    return View(tuple(d.pop("size")), tuple(d.pop("center")), d.pop("omega"), tuple(d.pop("dist"))), d
+
+
+def load_view(camera, default):
+    """The View in views/<camera>.json (camera = "thermal" or "optical"), or `default` if there is none."""
+    path = VIEW_DIR / f"{camera}.json"
+    return read_view(path)[0] if path.exists() else default
+
+
+def save_view(camera, view, into=None, **info):
+    """Write `view` as <into>/<camera>.json, with `info` (e.g. the calibration report) for the record.
+    Without `into` it goes to views/, is the view in use from then on (THERMAL_VIEW / OPTICAL_VIEW)
+    and is loaded again at the next start."""
+    (into or VIEW_DIR).mkdir(parents=True, exist_ok=True)
+    data = {**asdict(view), **info, "saved": f"{datetime.now():%Y-%m-%d %H:%M:%S}"}
+    ((into or VIEW_DIR) / f"{camera}.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+    if into is None:
+        globals()[f"{camera.upper()}_VIEW"] = view
+
+
+# Build plate frame x'-y': origin at the plate centre, mm, +x' right and +y' up seen from above; it turns
+# with the plate (parts are fixed in it). The views map pixels to where x'-y' is at rotation 0 (the machine
+# frame, fixed with the cameras): a plate point p is seen at turn(p, rotation).
 PLATE_R_INNER, PLATE_R_OUTER = 15, 100     # mm
-# Placeholders until measured on the rig: center and omega by hand, size and dist from
-# calibrate_view() (key c in the live view).
-OPTICAL_VIEW = View(size=(88.209, 66.02), center=(-56.46213605, 27.8451025), omega=320, dist=(-0.030203, 0.014376, 0.000732, 9.4e-05, -0.006925))
-THERMAL_VIEW = View(size=(115.5, 86.5), center=(-5.86124587, 57.00031636), omega=280)
+
+
+def turn(xy, deg):
+    """Points xy (..., 2) mm turned by `deg` counter-clockwise (seen from above) about the plate centre."""
+    c, s = np.cos(np.radians(deg)), np.sin(np.radians(deg))
+    xy = np.asarray(xy, float)
+    return np.stack([c * xy[..., 0] - s * xy[..., 1], s * xy[..., 0] + c * xy[..., 1]], -1)
+
 BOARD_SQUARE = 5.00                      # mm, side of one calibration checkerboard square
-CALIBRATION_DIR = Path(__file__).resolve().parent / "calibration"   # pictures taken with c
+CALIBRATION_DIR = Path(__file__).resolve().parent / "calibration"   # checkerboard pictures, one folder per session
+VIEW_DIR = Path(__file__).resolve().parent / "views"                # thermal.json, optical.json: the views in use
+PICTURE_DIR = Path(__file__).resolve().parent / "pictures"          # pairs stored by save_pair (app.py: p)
+# The views in use come from views/<camera>.json (written by app.py: Calibration). These defaults apply
+# only if a file is missing: center and omega measured by hand, size and dist from calibrate_view().
+THERMAL_VIEW = load_view("thermal", View(size=(115.5, 86.5), center=(-5.86124587, 57.00031636), omega=280))
+OPTICAL_VIEW = load_view("optical", View(size=(88.209, 66.02), center=(-56.46213605, 27.8451025), omega=320,
+                                         dist=(-0.030203, 0.014376, 0.000732, 9.4e-05, -0.006925)))
 
 
 def placeholder(title, size=(640, 480)):
@@ -132,16 +173,22 @@ class FramePair:
     optical: np.ndarray      # BGR uint8
     thermal_live: bool
     optical_live: bool
+    rotation: float = 0.0    # deg the build plate had turned (counter-clockwise seen from above) when taken
+
+    def seen_at(self, x, y):
+        """Where the cameras saw build plate point(s) (x', y') mm: the points turned by self.rotation."""
+        there = turn(np.stack(np.broadcast_arrays(x, y), -1), self.rotation)
+        return there[..., 0], there[..., 1]
 
     def temperature(self, x, y):
         """deg C at build plate point(s) (x', y') mm, interpolated from the original thermal picture.
         NaN where the thermal camera does not see the point (or while it calibrates)."""
-        return _sample(self.thermal_c, *THERMAL_VIEW.to_pixel(x, y, self.thermal_c.shape))
+        return _sample(self.thermal_c, *THERMAL_VIEW.to_pixel(*self.seen_at(x, y), self.thermal_c.shape))
 
     def colour(self, x, y):
         """Optical BGR (float32, last axis 3) at build plate point(s) (x', y') mm, interpolated from the
         original optical picture. NaN where the optical camera does not see the point."""
-        bgr = _sample(self.optical, *OPTICAL_VIEW.to_pixel(x, y, self.optical.shape))
+        bgr = _sample(self.optical, *OPTICAL_VIEW.to_pixel(*self.seen_at(x, y), self.optical.shape))
         if not self.optical_live:
             bgr[...] = np.nan
         return bgr
@@ -315,7 +362,7 @@ class CameraRig:
         self.close()
 
 
-def calibrate_view(view, pictures, square=BOARD_SQUARE, marked=None):
+def calibrate_view(view, pictures, square=BOARD_SQUARE, marked=None, report=None):
     """`view` with size and dist fitted to pictures of a flat checkerboard in the print plane.
 
     The board must cover the picture centre and at least 40% of the picture, better all of it (the
@@ -325,7 +372,8 @@ def calibrate_view(view, pictures, square=BOARD_SQUARE, marked=None):
     pair.thermal_c; the thermal camera needs a board that shows up warm/cold). Prints how well the
     fitted view matches the corners. If `marked` is a list, one BGR picture per picture is appended
     showing what was found: yellow = corner candidates, green = checkerboard corners and grid,
-    red = where the fitted view puts them, text = verdict.
+    red = where the fitted view puts them, text = verdict. If `report` is a dict, the fit statistics
+    are put in it (pictures used, corners, error rms/max, reach).
     """
     def corner_near(gray, strong, peaks, guess, step):   # checkerboard corner refined from `guess`, or None
         size = np.hypot(*step)                        # `step` = one square along a row or column, px
@@ -521,6 +569,10 @@ def calibrate_view(view, pictures, square=BOARD_SQUARE, marked=None):
     rms = np.sqrt(np.mean(err**2))
     print(f"{len(err)} corners, error rms {rms:.2f} px = {rms * p[0] / w:.3f} mm, max {err.max():.2f} px; "
           f"corners reach {reach:.0%} of the way to the picture corners")
+    if report is not None:
+        report.update(pictures_used=len(boards), pictures=len(pictures), corners=len(err),
+                      rms_px=round(float(rms), 3), rms_mm=round(float(rms * p[0] / w), 4),
+                      max_px=round(float(err.max()), 3), reach=round(float(reach), 3))
     return replace(view, size=tuple(round(float(s), 3) for s in p[:2]), dist=tuple(round(float(d), 6) for d in p[2:7]))
 
 
@@ -547,30 +599,116 @@ def side_by_side(pair):
     return np.hstack(panels)
 
 
-def calibrate_both(folder):
-    """Calibrate both views from the pictures in `folder` (thermal_<n>.npy = thermal_c, optical_<n>.png)
-    and print View lines to paste in. Writes <name>_<n>_corners.png next to them: what was found."""
-    for name, view, kind, load in (("THERMAL_VIEW", THERMAL_VIEW, "thermal", "npy"),
-                                   ("OPTICAL_VIEW", OPTICAL_VIEW, "optical", "png")):
-        files = sorted((f for f in folder.glob(f"{kind}_*.{load}") if f.stem[len(kind) + 1:].isdigit()),
-                       key=lambda f: int(f.stem[len(kind) + 1:]))     # not the *_corners.png ones
+def save_board_picture(folder, number, pair, cameras=("thermal", "optical")):
+    """Store `pair` as calibration picture `number` in `folder`: thermal_<n>.npy (= thermal_c) and
+    thermal_<n>_colour.png, optical_<n>.png; only cameras in `cameras` that deliver. Returns those stored."""
+    folder.mkdir(parents=True, exist_ok=True)
+    stored = []
+    if "thermal" in cameras and pair.thermal_live and not np.isnan(pair.thermal_c).all():   # not calibrating
+        np.save(folder / f"thermal_{number}.npy", pair.thermal_c)
+        cv2.imwrite(str(folder / f"thermal_{number}_colour.png"), pair.thermal)
+        stored.append("thermal")
+    if "optical" in cameras and pair.optical_live:
+        cv2.imwrite(str(folder / f"optical_{number}.png"), pair.optical)
+        stored.append("optical")
+    return stored
+
+
+def save_pair(pair, folder=None):
+    """Store `pair` in pictures/ (or `folder`) as <time>.png (side by side, to look at) and the original
+    pictures for processing: <time>_thermal.npy (= thermal_c, deg C), <time>_thermal.png (false colours),
+    <time>_optical.png; only the cameras that deliver; <time>.json = the plate rotation. Returns the path
+    of <time>.png (see load_pair)."""
+    folder = folder or PICTURE_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = base = f"{datetime.fromtimestamp(pair.timestamp):%Y-%m-%d_%H-%M-%S}"
+    while (folder / f"{stem}.png").exists():          # more than one in a second
+        stem = f"{base}_{int(stem[len(base) + 1:] or 1) + 1}"
+    cv2.imwrite(str(folder / f"{stem}.png"), side_by_side(pair))
+    (folder / f"{stem}.json").write_text(json.dumps({"rotation_deg": pair.rotation}), encoding="utf-8")
+    if pair.thermal_live:
+        np.save(folder / f"{stem}_thermal.npy", pair.thermal_c)
+        cv2.imwrite(str(folder / f"{stem}_thermal.png"), pair.thermal)
+    if pair.optical_live:
+        cv2.imwrite(str(folder / f"{stem}_optical.png"), pair.optical)
+    return folder / f"{stem}.png"
+
+
+def load_pair(path):
+    """The FramePair stored by save_pair; `path` = its <time>.png or any file stored with it. A camera
+    not stored gives a placeholder, as in CameraRig.grab(). Timestamp from the file name (to the second),
+    rotation from <time>.json (0 if there is none)."""
+    path = Path(path)
+    stem = path.stem.removesuffix("_thermal").removesuffix("_optical").removesuffix("_points")
+    files = {end: path.with_name(f"{stem}{end}") for end in ("_thermal.npy", "_thermal.png", "_optical.png", ".json")}
+    thermal_live = files["_thermal.npy"].exists() and files["_thermal.png"].exists()
+    optical_live = files["_optical.png"].exists()
+    thermal = cv2.imread(str(files["_thermal.png"])) if thermal_live else placeholder("Thermal: Optris PI 640i")
+    try:
+        timestamp = datetime.strptime(stem[:19], "%Y-%m-%d_%H-%M-%S").timestamp()
+    except ValueError:                                # renamed
+        timestamp = path.stat().st_mtime
+    return FramePair(timestamp, thermal,
+                     np.load(files["_thermal.npy"]) if thermal_live else np.full(thermal.shape[:2], np.nan, np.float32),
+                     cv2.imread(str(files["_optical.png"])) if optical_live else placeholder("Optical: MOKOSE UC50"),
+                     thermal_live, optical_live, json.loads(files[".json"].read_text(encoding="utf-8"))["rotation_deg"]
+                     if files[".json"].exists() else 0.0)
+
+
+def align_view(view, pixels, shape, plate, zoom=False):
+    """`view` moved so that the pixels `pixels` [(u, v), ...] of its picture (of shape `shape`) land on
+    the build plate points `plate` [(x', y') mm, ...], e.g. where the other camera sees the same features:
+    new center and omega (with one point: center only), with `zoom` also size (both sides by the same
+    factor; 2 points or more). Lens distortion is kept. Least squares (closed form).
+    Returns (view, how far each point stays off, mm)."""
+    pixels, plate = np.asarray(pixels, float), np.asarray(plate, float)
+    own = np.stack(replace(view, center=(0, 0), omega=0).to_plate(*pixels.T, shape), 1)   # mm, picture's axes
+    a, b = own - own.mean(0), plate - plate.mean(0)
+    many = len(plate) > 1
+    angle = np.arctan2(np.sum(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]), np.sum(a * b)) if many else np.radians(view.omega)
+    turn = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+    scale = np.sum(b * (a @ turn.T)) / np.sum(a * a) if zoom and many else 1.0
+    center = plate.mean(0) - scale * turn @ own.mean(0)
+    fitted = replace(view, center=tuple(round(float(c), 4) for c in center),
+                     omega=round(float(np.degrees(angle)) % 360, 4),
+                     size=view.size if scale == 1 else tuple(round(float(s * scale), 4) for s in view.size))
+    return fitted, np.hypot(*(np.stack(fitted.to_plate(*pixels.T, shape), 1) - plate).T)
+
+
+def calibrate_folder(folder, cameras=("thermal", "optical"), square=BOARD_SQUARE):
+    """Calibrate the views of `cameras` from the pictures in `folder` (thermal_<n>.npy, optical_<n>.png)
+    of a checkerboard with `square` mm squares, keeping center and omega of the views in use. Writes
+    <camera>_<n>_corners.png next to the pictures (what was found) and, where it worked, <camera>.json
+    (fitted view + report). Returns {camera: (view, report)} for the cameras where it worked; nothing
+    is put in use."""
+    results = {}
+    for camera in cameras:
+        load = "npy" if camera == "thermal" else "png"
+        files = sorted((f for f in folder.glob(f"{camera}_*.{load}") if f.stem[len(camera) + 1:].isdigit()),
+                       key=lambda f: int(f.stem[len(camera) + 1:]))     # not the *_corners.png ones
         if not files:
             continue
         pictures = [np.load(f) if load == "npy" else cv2.imread(str(f)) for f in files]
-        print(f"\n{name} calibration ({', '.join(f.name for f in files)}):")
-        marked = []
+        print(f"\n{camera.upper()}_VIEW calibration ({', '.join(f.name for f in files)}; {square:g} mm squares):")
+        marked, report = [], {"folder": folder.name, "square_mm": square}
         try:
-            print(f"{name} = {calibrate_view(view, pictures, marked=marked)}")
+            view = calibrate_view(THERMAL_VIEW if camera == "thermal" else OPTICAL_VIEW, pictures, square,
+                                  marked=marked, report=report)
+            save_view(camera, view, into=folder, **report)
+            print(f"{camera.upper()}_VIEW = {view}   (saved as {folder.name}/{camera}.json)")
+            results[camera] = view, report
         except RuntimeError as exc:
             print(exc)
         for f, mark in zip(files, marked):
             cv2.imwrite(str(f.with_name(f"{f.stem}_corners.png")), mark)
-        print(f"Corners found: {folder / kind}_<n>_corners.png")
+        print(f"Corners found: {folder / camera}_<n>_corners.png")
+    return results
 
 
 def main():
-    if len(sys.argv) > 1:                             # python dual_camera.py calibration/<time>
-        calibrate_both(Path(sys.argv[1]))
+    if len(sys.argv) > 1:                             # python dual_camera.py calibration/<time> [square mm]
+        calibrate_folder(Path(sys.argv[1]), square=float(sys.argv[2]) if len(sys.argv) > 2 else BOARD_SQUARE)
+        print("\nTo use a result: app.py > Calibration > Save, or copy <folder>/<camera>.json to views/")
         return
     window = "Thermal | Optical"
     folder = CALIBRATION_DIR / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -584,18 +722,14 @@ def main():
                 rig.optical_settings()
             if key == ord("c"):
                 taken += 1
-                folder.mkdir(parents=True, exist_ok=True)
-                if pair.thermal_live:
-                    np.save(folder / f"thermal_{taken}.npy", pair.thermal_c)
-                    cv2.imwrite(str(folder / f"thermal_{taken}_colour.png"), pair.thermal)
-                if pair.optical_live:
-                    cv2.imwrite(str(folder / f"optical_{taken}.png"), pair.optical)
-                print(f"Calibration picture {taken} saved in {folder}")
+                stored = save_board_picture(folder, taken, pair)
+                print(f"Calibration picture {taken} ({' + '.join(stored) or 'no camera delivers'}) saved in {folder}")
             if key in (27, ord("q")) or cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1:
                 break
     cv2.destroyAllWindows()
     if taken:
-        calibrate_both(folder)
+        calibrate_folder(folder)
+        print("\nTo use a result: app.py > Calibration > Save, or copy <folder>/<camera>.json to views/")
 
 
 if __name__ == "__main__":

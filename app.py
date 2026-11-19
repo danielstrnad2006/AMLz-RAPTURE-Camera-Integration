@@ -3,6 +3,7 @@ app.py - the GUI: live view of both cameras, pictures, video recording, build pl
 and alignment.
 
 Run:  python app.py        (Windows or Linux; what to install: see dual_camera.py)
+      Linux: with the conda env's Python, ~/miniconda3/envs/rapture/bin/python app.py (see dual_camera.py)
 Main window: live thermal | optical view. Take a picture (p) into pictures/ (see dual_camera.save_pair),
 record a real-time clip (r) or a timelapse (t) as MP4 in clips/ (see capture_dual_video.py), show the
 current moment on the build plate (space, see plate_plot.py), open the optical camera's own settings

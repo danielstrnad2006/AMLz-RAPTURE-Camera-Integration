@@ -2,8 +2,17 @@
 dual_camera.py - Optris PI 640i (thermal) + MOKOSE UC50 (optical), both over USB, Windows or Linux (Ubuntu).
 
 Install once:  Windows: python -m pip install opencv-python numpy matplotlib pygrabber
-               Linux:   sudo apt install python3-numpy python3-opencv python3-matplotlib python3-tk
-                        x11-xserver-utils qv4l2   (the system Python: the Optris SDK is built for its NumPy)
+               Linux:   sudo apt install x11-xserver-utils qv4l2   (xrandr/xrdb for the window layout and
+                        display scaling; qv4l2 = the optical camera's settings window)
+                        The Optris SDK for Linux comes as .deb packages (libirimager, otcsdk) and puts
+                        optris.otcsdk into /usr/lib/python3/dist-packages. It is built for NumPy 1.x; a
+                        newer Ubuntu's system Python has NumPy 2 (import fails with "_ARRAY_API not
+                        found"), so use a conda env (conda-forge: no Anaconda ToS needed) instead:
+                        conda create -n rapture --override-channels -c conda-forge python=3.12 "numpy<2"
+                                     "opencv<4.11" matplotlib tk
+                        ln -s /usr/lib/python3/dist-packages/optris \
+                              ~/miniconda3/envs/rapture/lib/python3.12/site-packages/optris
+                        and run with  ~/miniconda3/envs/rapture/bin/python app.py
                plus the Optris thermal camera SDK (provides the Python module optris.otcsdk);
                Windows: restart the PC after installing it.
 Run:           python app.py                  (the GUI: live view, recording, build plate, calibration)

@@ -217,7 +217,7 @@ def _sample(img, u, v):
     inside = (u >= 0) & (u <= w - 1) & (v >= 0) & (v <= h - 1)          # also False for NaN
     u, v = np.where(inside, u, 0), np.where(inside, v, 0)
     u0, v0 = np.minimum(u.astype(int), w - 2), np.minimum(v.astype(int), h - 2)
-    fu, fv = u - u0, v - v0
+    fu, fv = (u - u0).astype(np.float32), (v - v0).astype(np.float32)     # float32: half the time
     if img.ndim == 3:
         fu, fv, inside = fu[..., None], fv[..., None], inside[..., None]
     out = ((img[v0, u0] * (1 - fu) + img[v0, u0 + 1] * fu) * (1 - fv)

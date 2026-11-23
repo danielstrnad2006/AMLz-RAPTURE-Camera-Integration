@@ -29,6 +29,7 @@ Grids: row 0 = largest y', column 0 = smallest x' (the plate seen from above); c
 x' = x0 + (i + 0.5) step, y' = y1 - (j + 0.5) step, with x0, y1 = the smallest x', largest y' of the corners.
 """
 import csv
+import functools
 import json
 import re
 import sys
@@ -52,9 +53,10 @@ COLUMNS = ("time", "timestamp", "rotation_deg", "thermal_mean_C", "thermal_min_C
 NUMBERS = COLUMNS[1:9]
 
 
-def new_area(name, corners):
+def new_area(name, corners, **info):
     """A new area `name` with the polygon `corners` [(x', y') mm, ...] in the plate's frame (2 corners =
-    the rectangle between them), stored as areas/<name>/area.json. Returns the area (dict)."""
+    the rectangle between them), stored as areas/<name>/area.json with `info` (e.g. the 3MF job and
+    island it comes from, see defect_detection.py). Returns the area (dict)."""
     name = re.sub(r'[<>:"/\\|?*]', "_", name.strip()).strip(". ")     # a valid folder name on Windows
     corners = [(float(x), float(y)) for x, y in corners]
     if len(corners) == 2:
@@ -68,7 +70,7 @@ def new_area(name, corners):
     if folder.exists():
         raise ValueError(f"there is an area '{name}' already")
     area = {"name": name, "corners": [[round(x, 3), round(y, 3)] for x, y in corners], "steps": dict(AREA_STEP),
-            "created": f"{datetime.now():%Y-%m-%d %H:%M:%S}"}
+            "created": f"{datetime.now():%Y-%m-%d %H:%M:%S}", **info}
     folder.mkdir(parents=True)
     (folder / "area.json").write_text(json.dumps(area, indent=2), encoding="utf-8")
     return {**area, "folder": folder}
@@ -105,6 +107,17 @@ def extent(area, camera, shape):
     return x0, x0 + shape[1] * step, y1 - shape[0] * step, y1
 
 
+@functools.lru_cache(maxsize=8)
+def picture_outline(view, shape):
+    """Where a picture of `shape` (height, width) lies through `view`, in the machine frame: points along
+    its edge, mm."""
+    h, w = shape
+    side = np.linspace(0, 1, 25)
+    u = np.r_[side * (w - 1), np.full(25, w - 1.0), (1 - side) * (w - 1), np.zeros(25)]
+    v = np.r_[np.zeros(25), side * (h - 1), np.full(25, h - 1.0), (1 - side) * (h - 1)]
+    return np.stack(view.to_plate(u, v, shape), -1)
+
+
 def map_area(pair, area):
     """`pair` resampled into `area` (with the plate turned by pair.rotation) through the views in use:
     {"thermal": deg C array or None, "optical": BGRA array or None}; None where the camera delivers
@@ -116,6 +129,10 @@ def map_area(pair, area):
         if not live or (camera == "thermal" and np.isnan(picture).all()):
             continue
         view = dual_camera.THERMAL_VIEW if camera == "thermal" else dual_camera.OPTICAL_VIEW
+        picture_at = turn(picture_outline(view, picture.shape[:2]), -pair.rotation)   # in the plate's frame
+        corners = np.array(area["corners"], float)
+        if ((picture_at.min(0) > corners.max(0)) | (picture_at.max(0) < corners.min(0))).any():
+            continue                                                 # bounding boxes apart: not in the picture
         xs, ys, inside = area_grid(area, camera)
         blocks = []
         for rows in np.array_split(ys, max(1, len(ys) // 200)):             # in blocks: less memory

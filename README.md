@@ -58,7 +58,70 @@ Every window has the same tabs: **Live**, **Calibration**, **Alignment** and **A
 | Alignment | Makes the optical camera agree with the thermal one: click the same feature in both pictures, then Fit and Save. The thermal camera is the reference. |
 | Areas | Draw areas on the build plate (in the plate's own millimetres) and record their history: thermal (°C) and optical pictures, the average temperature and the mean temperature over time. Each picture goes into every area, with lens distortion removed. |
 
-Other entry points:
+### Background service
+
+To run the cameras without any window, for example on the PC at the machine:
+
+```
+python camera_service.py                  # reachable from this PC only
+python camera_service.py --host 0.0.0.0   # reachable from the network too
+```
+
+It does everything that has to go on without anyone watching:
+- taking pictures and recording clips or timelapses;
+- putting pictures into the areas, including "record every n s";
+- keeping the plate rotation to use for the next pictures.
+
+Ctrl+C stops it. There is no login: anyone who can reach the port can record and create areas.
+
+`app.py` runs the same service inside itself, so while the app is open the same API is available at
+`http://localhost:8765/api`. Only one program can use the cameras at a time, so run either the app or the
+background service.
+
+Use the API with any HTTP client. Opening `http://localhost:8765/api` in a browser lists all the addresses.
+
+| Request | What it does |
+|---|---|
+| `GET /api/state` | Camera states, recording, area recording, plate rotation |
+| `GET /api/live.jpg`, `GET /api/live.mjpg` | The live picture, or a live stream (open it in a browser) |
+| `GET /api/temperature?x=..&y=..` | °C at a build plate point, now |
+| `GET /api/areas`, `GET /api/areas/<name>` | The areas, or one area with its history |
+| `POST /api/picture` | Take a picture into `pictures/` |
+| `POST /api/record` `{"kind": "clip"}` or `{"kind": "timelapse"}`, `POST /api/record/stop` | Start or stop a recording |
+| `POST /api/areas` `{"name": "part 1", "corners": [[x, y], ...]}` | Create an area (2 corners make a rectangle) |
+| `POST /api/areas/record` | Put the current moment into all areas |
+| `POST /api/areas/every` `{"seconds": 10}` | Put a picture into all areas every 10 s (0 stops it) |
+| `POST /api/rotation` `{"deg": 12.5}` | Plate rotation for the pictures from now on |
+
+For example:
+```
+curl -X POST localhost:8765/api/areas/every -H "Content-Type: application/json" -d "{\"seconds\": 10}"
+```
+
+### Monitored areas from a sliced job (defect detection)
+
+```
+python defect_detection.py job.3mf            # show the first layer and the monitored areas
+python defect_detection.py job.3mf --create   # also store the areas in areas/
+```
+
+This covers parts whose cross-section stays the same through the whole height.
+
+- **First layer:** the job's sectors are read until they add up to 360°, which is one revolution. With a
+  constant cross-section, that revolution contains the whole cross-section.
+- **Melted islands:** its scan vectors are drawn into a map of what gets melted. Each separate melted
+  island becomes one monitored area.
+- **Margin:** each area is kept 0.3 mm inside the melted region (`--inset`), so powder doesn't end up in
+  an area.
+- **Tiles:** `--tile 4` cuts the islands into 4 mm squares.
+- **Plot:** the window shows the scan vectors, the sectors, the areas and where both cameras look.
+
+With `--create`, the areas are stored like any other area, so the app and the background service
+record them: Take picture, Record every, or the API. Each picture goes into every area a camera sees at
+that moment.
+
+### Other entry points
+
 
 - `python dual_camera.py`: plain live view (q quits).
 - `python dual_camera.py calibration/<time> [square mm]`: calibrate again from saved pictures, without cameras.
@@ -70,9 +133,11 @@ Other entry points:
 | Path | Contents |
 |---|---|
 | `app.py` | The GUI, styled like the RAPTURE machine interface (AMCF) |
+| `camera_service.py` | The cameras as a background service with an HTTP API (also used by `app.py`) |
 | `dual_camera.py` | Camera access, build plate mapping, calibration, saving and loading pictures |
 | `plate_plot.py` | Drawing the cameras' pictures onto the build plate |
 | `area_history.py` | Areas and their history |
+| `defect_detection.py` | Monitored areas from a sliced 3MF job |
 | `capture_dual_video.py` | Clip and timelapse recording |
 | `views/` | The camera views in use (`thermal.json`, `optical.json`) |
 | `pictures/`, `calibration/`, `areas/`, `clips/` | What the program saves (not in git) |

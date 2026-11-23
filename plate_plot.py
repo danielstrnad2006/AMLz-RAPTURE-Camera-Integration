@@ -24,7 +24,9 @@ import dual_camera
 from dual_camera import PLATE_R_INNER, PLATE_R_OUTER, CameraRig, _sample, side_by_side, turn
 
 OVERSAMPLE = 1.5     # plate pixels per camera pixel (at the picture centre): more = sharper when zoomed, slower
-COLOURS = {"thermal": "#ED8B00", "optical": "#1D4ED8"}   # picture outlines; the rest as the RAPTURE interface (app.py)
+COLOURS = {"thermal": "#ED8B00", "optical": "#1D4ED8"}
+PALETTE = ("#34D399", "#60A5FA", "#FBBF24", "#FB923C", "#A78BFA", "#F472B6", "#2DD4BF", "#F87171", "#A3E635",
+           "#94A3B8")          # one colour per part / area / point, in this order (the AMCF part palette, rapture.js)   # picture outlines; the rest as the RAPTURE interface (app.py)
 
 
 def edge(shape, n=50):

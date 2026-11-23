@@ -19,6 +19,8 @@ they land where the thermal camera sees them (the thermal view is the reference)
 Areas window: draw areas on the build plate; pictures taken there (p, or every few seconds) go into each
 area in plate mm, lens distortion taken out (see area_history.py); the selected area's history: thermal
 (deg C) and optical picture of each moment, the thermal average, the mean temperature over time.
+The cameras, recording and areas recording are camera_service.Service, which keeps running what needs no
+window (record every n s goes on with the Areas window closed) and serves its HTTP API while the app runs.
 Looks like the RAPTURE machine interface (the AMCF web client with its RAPTURE theme), see amcf_theme; every
 window has the same tab bar (Live, Calibration, Alignment, Areas) and state chips for the cameras.
 """
@@ -50,12 +52,12 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 import dual_camera
-from area_history import delete_entry, draw_history, load_areas, load_history, new_area, record, thermal_average
-from capture_dual_video import Recorder
+from area_history import delete_entry, draw_history, load_areas, load_history, thermal_average
+from camera_service import Service, serve
 from dual_camera import (BOARD_SQUARE, CALIBRATION_DIR, PICTURE_DIR, PLATE_R_INNER, PLATE_R_OUTER, VIEW_DIR,
-                         CameraRig, _sample, align_view, calibrate_folder, load_pair, read_view, save_board_picture,
-                         save_pair, save_view, side_by_side)
-from plate_plot import draw_plate, edge, plate_layers, rgba
+                         _sample, align_view, calibrate_folder, load_pair, read_view, save_board_picture,
+                         save_view)
+from plate_plot import PALETTE, draw_plate, edge, plate_layers, rgba
 
 CAMERAS = ("thermal", "optical")
 PREVIEW_SIZE = (1280, 480)     # px, live view at start-up (shrinks with the window)
@@ -69,8 +71,6 @@ PICTURE_SHARE = 0.45           # calibration picture viewer at start-up: this sh
 TEAL, TEAL_SOFT, NAVY, AMBER, GREEN, BLUE = "#0F766E", "#D5EFEC", "#111827", "#ED8B00", "#2E7D32", "#1D4ED8"
 PAGE, CARD, BORDER, TEXT, MUTED, FAINT = "#F4F5F7", "#FFFFFF", "#D5D8DD", "#1F2933", "#6B7280", "#9CA3AF"
 ERROR, WARN, OFF = "#C62828", "#B45309", "#E5E7EB"       # WARN: amber text; OFF: disabled / empty
-PALETTE = ("#34D399", "#60A5FA", "#FBBF24", "#FB923C", "#A78BFA", "#F472B6", "#2DD4BF", "#F87171", "#A3E635",
-           "#94A3B8")                          # one colour per part / point, in this order (rapture.js)
 CHIPS = {"ok": GREEN, "info": BLUE, "warn": AMBER, "err": ERROR, "off": "#374151"}   # state chip colours
 ASSETS = Path(__file__).resolve().parent       # rapture_logo.png, rapture_icon.png (from the AMCF resources)
 
@@ -387,43 +387,6 @@ class Log:
             box.configure(state="disabled")
 
 
-class Cameras(threading.Thread):
-    """The CameraRig, grabbing continuously in its own thread: rig.grab() waits up to 0.4 s for the
-    optical camera, the window must not. Also feeds the video being recorded, so it gets every picture."""
-
-    def __init__(self):
-        super().__init__(daemon=True)
-        self.lock = threading.Lock()       # held while the recorder is used
-        self.latest = None                 # (pair, side_by_side(pair)) of the last grab
-        self.count = 0                     # grabs so far
-        self.recorder = None               # capture_dual_video.Recorder while recording
-        self.jobs = queue.Queue()          # functions f(rig) to run in this thread, e.g. the settings window
-        self.stopping = False
-
-    def run(self):
-        try:
-            with CameraRig() as rig:
-                while not self.stopping:
-                    while not self.jobs.empty():
-                        self.jobs.get()(rig)
-                    pair = rig.grab()
-                    frame = side_by_side(pair)
-                    with self.lock:
-                        if self.recorder is not None:
-                            self.recorder.add(pair, frame)
-                        self.latest, self.count = (pair, frame), self.count + 1
-                    if not pair.optical_live:
-                        time.sleep(0.03)       # no optical camera to wait for: about the thermal frame rate
-        except Exception:
-            traceback.print_exc()
-            print("Camera thread stopped; restart the program")
-        finally:
-            with self.lock:
-                if self.recorder is not None:
-                    self.recorder.stop()
-                    self.recorder = None
-
-
 class App:
     """Main window: live view, pictures, recording, build plate view, optical settings; opens the calibration,
     alignment and areas windows."""
@@ -433,7 +396,9 @@ class App:
         self.log = Log(sys.stdout)
         sys.stdout = sys.stderr = self.log
         self.calls = queue.Queue()         # functions from worker threads, run in the Tk thread
-        self.cams = Cameras()
+        self.service = Service()           # the cameras, recording, areas (camera_service.py)
+        self.cams = self.service.cams
+        self.recording_shown = None        # what the record buttons show
         self.calibration = None            # the calibration window, while open
         self.alignment = None              # the alignment window, while open
         self.areas = None                  # the areas window, while open
@@ -441,7 +406,6 @@ class App:
         self.rate = []                     # (time, cams.count), last few seconds: pictures per second
         self.chips = []                    # per window: its state chip labels (add_chips)
         self.chips_shown = None            # what they show
-        self.calibrating = False           # the thermal camera of the last picture shown calibrates
 
         root.title("RAPTURE cameras")
         self.add_chips(toolbar(root, "Live", self.tabs()))
@@ -477,7 +441,8 @@ class App:
         self.update_buttons()
         self.views_changed()
         fit_to_screen(root)
-        self.cams.start()
+        self.server = serve(self.service)  # the same HTTP API as camera_service.py, while the app runs
+        self.service.start()
         self.tick()
 
     def tick(self):
@@ -491,7 +456,6 @@ class App:
             if recorder is not None:
                 frame = frame.copy()
                 recorder.mark(frame)
-            self.calibrating = latest[0].thermal_live and bool(np.isnan(latest[0].thermal_c).all())
             self.preview_photo = photo(frame, area_size(self.preview_area, PREVIEW_SIZE))
             self.preview.configure(image=self.preview_photo, text="")
             now = time.monotonic()
@@ -501,7 +465,12 @@ class App:
                 self.status.configure(text=f"{(c1 - c0) / (t1 - t0):.1f} pictures/s")
         if not self.cams.is_alive():
             self.status.configure(text="Cameras stopped (see log)")
-        self.update_chips()
+        state = self.service.state()
+        self.update_chips(state)
+        if state["recording"] != self.recording_shown:     # also started / stopped through the API
+            self.update_buttons()
+        if self.areas is not None:
+            self.areas.poll(state)
         self.root.after(30, self.tick)
 
     def tabs(self):
@@ -521,30 +490,20 @@ class App:
         self.chips.append(chips)
         self.chips_shown = None                        # show them at the next tick
 
-    def update_chips(self):
-        """The state chips of all windows: colour + symbol + text (state never by colour alone)."""
-        latest, recorder = self.cams.latest, self.cams.recorder
-        pair = latest[0] if latest else None
-        stopped = self.cams.ident is not None and not self.cams.is_alive()
-
-        def camera(name, live, calibrating=False):
-            if stopped:
-                return "err", f"!  {name} STOPPED"
-            if pair is None:
-                return "off", f"–  {name} STARTING"
-            if not live:
-                return "off", f"–  {name} NOT CONNECTED"
-            return ("info", f"i  {name} CALIBRATING") if calibrating else ("ok", f"✓  {name} LIVE")
-
-        states = (camera("THERMAL", pair and pair.thermal_live, self.calibrating), camera("OPTICAL", pair and pair.optical_live),
-                  ("ok", f"●  REC {'TIMELAPSE' if recorder.timelapse else 'CLIP'}") if recorder else None)
+    def update_chips(self, state):
+        """The state chips of all windows from service.state(): colour + symbol + text (never colour alone)."""
+        look = {"live": ("ok", "✓"), "calibrating": ("info", "i"), "starting": ("off", "–"),
+                "not connected": ("off", "–"), "stopped": ("err", "!")}
+        states = tuple((look[state[name]][0], f"{look[state[name]][1]}  {name.upper()} {state[name].upper()}")
+                       for name in CAMERAS)
+        states += (("ok", f"●  REC {state['recording'].upper()}") if state["recording"] else None,)
         if states == self.chips_shown:
             return
         self.chips_shown = states
         self.chips = [chips for chips in self.chips if chips[0].winfo_exists()]
         for chips in self.chips:
-            for chip, state in zip(chips, states):
-                chip.configure(style=f"Chip{state[0]}.TLabel" if state else "Navy.TLabel", text=state[1] if state else "")
+            for chip, shown in zip(chips, states):
+                chip.configure(style=f"Chip{shown[0]}.TLabel" if shown else "Navy.TLabel", text=shown[1] if shown else "")
 
     def work(self, job, then):
         """job() in a worker thread, then then(result) in the Tk thread; result None if job failed."""
@@ -558,27 +517,17 @@ class App:
         threading.Thread(target=run, daemon=True).start()
 
     def take_picture(self):
-        """The current moment as pictures in pictures/ (see dual_camera.save_pair). Returns the path or None."""
-        if self.cams.latest is None:
-            print("No picture from the cameras yet")
-            return None
-        path = save_pair(self.cams.latest[0])
-        print(f"Picture saved: {path.parent.name}/{path.name} (side by side; next to it the original pictures "
-              f"and the temperatures: {path.stem}_thermal.npy / _thermal.png / _optical.png)")
-        return path
+        """The current moment as pictures in pictures/ (see Service.take_picture). Returns the path or None."""
+        return self.service.take_picture()
 
     def record(self, timelapse):
         """Start a clip / timelapse, or stop the one being recorded."""
-        with self.cams.lock:
-            if self.cams.recorder is not None:
-                self.cams.recorder.stop()
-                self.cams.recorder = None
-            elif self.cams.latest is not None:
-                self.cams.recorder = Recorder(timelapse, self.cams.latest[1].shape[1::-1])
+        self.service.record(None if self.cams.recorder is not None else timelapse)
         self.update_buttons()
 
     def update_buttons(self):
         recorder = self.cams.recorder
+        self.recording_shown = None if recorder is None else "timelapse" if recorder.timelapse else "clip"
         for button, timelapse, name in ((self.clip_button, False, "clip (R)"), (self.lapse_button, True, "timelapse (T)")):
             mine = recorder is not None and recorder.timelapse == timelapse
             button.configure(text=f"■  Stop {name}" if mine else f"●  Record {name}",
@@ -618,7 +567,7 @@ class App:
     def optical_settings(self):
         if dual_camera.WINDOWS:                  # Linux: a program of its own, the live view keeps running
             print("Optical camera settings window: the live view pauses until it is closed")
-        self.cams.jobs.put(lambda rig: rig.optical_settings())
+        self.service.optical_settings()
 
     def open_calibration(self):
         if self.calibration is None:
@@ -650,12 +599,9 @@ class App:
                 window.views_changed()
 
     def close(self):
-        self.cams.stopping = True
-        self.cams.join(timeout=3)
-        with self.cams.lock:
-            if self.cams.recorder is not None:     # camera thread stuck (e.g. settings window open)
-                self.cams.recorder.stop()
-                self.cams.recorder = None
+        if self.server is not None:
+            self.server.shutdown()
+        self.service.close()
         sys.stdout = sys.stderr = self.log.console
         self.root.destroy()
 
@@ -1428,12 +1374,15 @@ class Areas:
         self.plate_ax = self.time_ax = None
         self.marks = []                    # areas drawn over the plate
         self.busy = self.plate_busy = False    # putting pictures into the areas / onto the plate (worker thread)
-        self.timer = None                  # after() job of "record every"
-        self.last_time = None              # timestamp of the last picture recorded
+        self.changes = app.service.areas_changed   # areas / histories as shown (poll refreshes on a change)
+        self.shown = None                  # (rotation, record every) of the service as shown
         self.closed = False
         self.name, self.corners = tk.StringVar(), tk.StringVar()
-        self.rotation, self.every = tk.StringVar(value="0"), tk.StringVar(value="10")
-        self.keep = tk.BooleanVar(value=False)
+        self.rotation = tk.StringVar(value=f"{app.service.rotation:g}")
+        self.every = tk.StringVar(value=f"{app.service.every or 10:g}")
+        self.keep = tk.BooleanVar(value=app.service.keep)
+        self.rotation.trace_add("write", lambda *_: self.rotation_typed())
+        self.keep.trace_add("write", lambda *_: setattr(app.service, "keep", self.keep.get()))
 
         app.add_chips(toolbar(win, "Areas", app.tabs()))
         page = ttk.Frame(win, style="Page.TFrame", padding=12)
@@ -1617,7 +1566,7 @@ class Areas:
         try:
             if corners is None:
                 raise ValueError("the corners must be pairs of numbers x' y'")
-            area = new_area(self.name.get(), corners)
+            area = self.app.service.new_area(self.name.get(), corners)
         except (ValueError, OSError) as exc:
             self.area_state.configure(text=f"Not created: {exc}")
             print(f"Area not created: {exc}")
@@ -1627,8 +1576,6 @@ class Areas:
         self.name.set("")
         self.selected, self.index = area["name"], -1
         self.area_state.configure(text="")
-        print(f"Area '{area['name']}' created, corners {area['corners']} mm on the plate; its history goes to "
-              f"areas/{area['folder'].name}/")
         self.update_buttons()
         self.refresh()
 
@@ -1649,6 +1596,7 @@ class Areas:
         if area is not None and messagebox.askyesno(
                 "Areas", f"Delete the area '{area['name']}' and its history ({len(self.rows)} pictures)?", parent=self.win):
             shutil.rmtree(area["folder"])
+            self.app.service.areas_changed += 1
             print(f"Area '{area['name']}' deleted")
             self.refresh()
 
@@ -1659,13 +1607,31 @@ class Areas:
         except ValueError:
             return None
 
+    def rotation_typed(self):                          # the service takes it for the pictures from now on
+        rotation = self.rotation_deg()
+        if rotation is not None:
+            self.app.service.rotation = rotation
+
+    def poll(self, state):
+        """Each tick of the app: refresh what changed in the service (also through its API, or recording
+        every n s in the background)."""
+        if self.app.service.areas_changed != self.changes:
+            self.changes = self.app.service.areas_changed
+            self.refresh()
+        shown = (state["rotation_deg"], state["areas_every_s"])
+        if shown != self.shown:
+            if self.shown is not None and shown[0] != self.shown[0] and shown[0] != self.rotation_deg():
+                self.rotation.set(f"{shown[0]:g}")         # set through the API
+            self.shown = shown
+            self.update_every()
+
     # Pictures into the areas -----------------------------------------------------------------------------
-    def take(self, quiet=False):
+    def take(self):
         latest = self.app.cams.latest
         if latest is None:
             print("No picture from the cameras yet")
-        elif not (quiet and latest[0].timestamp == self.last_time):     # recording: only new pictures
-            self.put([latest[0]], plate=not quiet, quiet=quiet)
+        else:
+            self.put([latest[0]], plate=True)
 
     def add_saved(self):
         chosen = filedialog.askopenfilenames(parent=self.win, title="Pictures to put into all areas",
@@ -1676,10 +1642,9 @@ class Areas:
         if stems:
             self.put(sorted(path.with_name(f"{stem}.png") for stem, path in stems.items()))
 
-    def put(self, sources, plate=False, quiet=False):
-        """Pictures into all areas, in a worker thread: `sources` = FramePairs, or paths of pairs stored by
-        save_pair (left out of an area whose history has them already). The plate rotation typed in goes with
-        them (not with stored pairs that have their own). `plate`: then show the last on the plate."""
+    def put(self, sources, plate=False):
+        """Pictures into all areas (Service.put, in a worker thread), with the plate rotation typed in.
+        `plate`: then show the last on the plate."""
         rotation = self.rotation_deg()
         if rotation is None:
             print("Plate turned by: must be a number (deg)")
@@ -1688,74 +1653,35 @@ class Areas:
             print("No areas yet: New area (n), then click its corners on the build plate")
             return
         if self.busy:
-            if not quiet:
-                print("Still putting the previous pictures into the areas")
+            print("Still putting the previous pictures into the areas")
             return
-        self.busy, areas, keep = True, list(self.areas), self.keep.get()
+        self.busy = True
         self.record_state.configure(text="Putting the pictures into the areas ...")
-
-        def job():
-            known = {a["name"]: {r["picture"] for r in load_history(a)} for a in areas}
-            pair = None
-            for source in sources:
-                if isinstance(source, Path):
-                    pair, picture = load_pair(source), source.name
-                    if not source.with_suffix(".json").exists():      # taken before rotations were stored
-                        pair = replace(pair, rotation=rotation)
-                    todo = [a for a in areas if picture not in known[a["name"]]]
-                else:
-                    pair = replace(source, rotation=rotation)
-                    picture, todo = save_pair(pair).name if keep else "", areas
-                done = record(pair, todo, picture)
-                parts = [f"{name} " + (f"{float(row['thermal_mean_C']):.1f} °C" if row["thermal_mean_C"] else "no °C")
-                         + f" (seen: thermal {float(row['thermal_seen']):.0%}, optical {float(row['optical_seen']):.0%})"
-                         for name, row in done.items()]
-                parts += [f"{a['name']} not seen" for a in todo if a["name"] not in done]
-                print(f"{datetime.fromtimestamp(pair.timestamp):%H:%M:%S}" + (f", plate at {pair.rotation:g}°" if pair.rotation else "")
-                      + ": " + ("; ".join(parts) if todo else f"{picture} is in all histories already")
-                      + (f"  (whole pictures: pictures/{picture})" if keep and not isinstance(source, Path) else ""))
-            return pair
-
-        self.app.work(job, lambda pair: self.put_done(pair, plate))
+        self.app.work(lambda: self.app.service.put(sources, rotation),
+                      lambda results: self.put_done(results[-1][0] if results else None, plate))
 
     def put_done(self, pair, plate):
         self.busy = False
         if self.closed:
             return
-        if pair is not None:
-            self.last_time = pair.timestamp
         self.record_state.configure(text="")
-        self.refresh()
         if plate and pair is not None:
             self.show_plate(pair)
 
     def toggle_every(self):
-        if self.timer is not None:
-            self.win.after_cancel(self.timer)
-            self.timer = None
-            print("Recording into the areas stopped")
+        """Record every n s, in the service: goes on with this window closed, until stopped."""
+        if self.app.service.every is not None:
+            self.app.service.record_every(None)
         else:
             try:
                 seconds = float(self.every.get())
             except ValueError:
                 seconds = 0
-            if seconds <= 0 or not self.areas:
-                print("Record every: needs seconds > 0 and at least one area")
-                return
-            print(f"Recording into the areas every {seconds:g} s (stop: the same button)")
-            self.every_tick()
+            self.app.service.record_every(seconds)
         self.update_every()
 
-    def every_tick(self):
-        try:
-            seconds = max(0.5, float(self.every.get()))
-        except ValueError:
-            seconds = 10
-        self.timer = self.win.after(round(seconds * 1000), self.every_tick)
-        self.take(quiet=True)
-
     def update_every(self):
-        on = self.timer is not None
+        on = self.app.service.every is not None
         self.every_button.configure(text="■  Stop recording" if on else "●  Record every",
                                     style="Danger.TButton" if on else "TButton")
 
@@ -1800,13 +1726,16 @@ class Areas:
         self.marks = []
         ax = self.plate_ax
         halo = [pe.withStroke(linewidth=3.5, foreground="black", alpha=0.55)]
+        many = len(self.areas) > 30                    # e.g. from a 3MF job: names only for the selected one
         for i, area in enumerate(self.areas):         # as the parts in the AMCF plate view: dashed, the selected solid teal
             xy = np.vstack([area["corners"], area["corners"][:1]])
             chosen, colour = area["name"] == self.selected, PALETTE[i % len(PALETTE)]
             self.marks += ax.fill(*xy.T, color=TEAL if chosen else colour, alpha=0.3 if chosen else 0.1, lw=0, zorder=6)
-            self.marks += ax.plot(*xy.T, color=TEAL if chosen else colour, lw=3 if chosen else 1.5,
+            self.marks += ax.plot(*xy.T, color=TEAL if chosen else colour, lw=3 if chosen else 1 if many else 1.5,
                                   ls="-" if chosen else (0, (6, 4)), zorder=7,
                                   path_effects=[pe.withStroke(linewidth=5, foreground="white")] if chosen else halo)
+            if many and not chosen:
+                continue
             top = xy[xy[:, 1].argmax()]
             self.marks.append(ax.text(top[0], top[1] + 1, area["name"], color="white" if chosen else colour, fontsize=9,
                                       ha="center", va="bottom", fontweight="bold" if chosen else "normal", zorder=8,
@@ -1918,8 +1847,9 @@ class Areas:
             self.refresh()
 
     def close(self):
-        if self.timer is not None:
-            self.win.after_cancel(self.timer)
+        if self.app.service.every is not None:
+            print(f"Recording into the areas every {self.app.service.every:g} s goes on (stop: Areas window, "
+                  "Stop recording)")
         self.closed = True
         self.app.areas = None
         self.win.destroy()

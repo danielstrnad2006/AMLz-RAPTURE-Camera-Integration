@@ -71,12 +71,12 @@ def plate_layers(pair, optical_view=None):
     thermal as deg C (2D), or as RGBA false colours while it calibrates; optical as RGBA."""
     layers = []
     if pair.thermal_live:
-        temps, extent, outline = on_plate(dual_camera.THERMAL_VIEW, pair.thermal_c, pair.rotation)
+        temps, extent, outline = on_plate(dual_camera.THERMAL_VIEW, pair.thermal_c, pair.turned("thermal"))
         if np.isnan(temps).all():                  # start-up calibration: no temperatures, false colours
-            temps = rgba(on_plate(dual_camera.THERMAL_VIEW, pair.thermal, pair.rotation)[0])
+            temps = rgba(on_plate(dual_camera.THERMAL_VIEW, pair.thermal, pair.turned("thermal"))[0])
         layers.append(("thermal", temps, extent, outline))
     if pair.optical_live:
-        picture, extent, outline = on_plate(optical_view or dual_camera.OPTICAL_VIEW, pair.optical, pair.rotation)
+        picture, extent, outline = on_plate(optical_view or dual_camera.OPTICAL_VIEW, pair.optical, pair.turned("optical"))
         layers.append(("optical", rgba(picture), extent, outline))
     return layers
 

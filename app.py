@@ -4,8 +4,13 @@ and alignment.
 
 Run:  python app.py        (Windows or Linux; what to install: see dual_camera.py)
       Linux: with the conda env's Python, ~/miniconda3/envs/rapture/bin/python app.py (see dual_camera.py)
+      python app.py --host 0.0.0.0           also serve the API to the network (to be used from another PC)
+      python app.py --connect <camera PC>    use the cameras of another PC running camera_service.py or
+                                             app.py --host 0.0.0.0 (no cameras needed here; the Areas
+                                             window works on the camera PC only)
 Main window: live thermal | optical view. Take a picture (p) into pictures/ (see dual_camera.save_pair),
-record a real-time clip (r) or a timelapse (t) as MP4 in clips/ (see capture_dual_video.py), show the
+record a real-time clip (r) or a timelapse (t) as MP4 in clips/ (see capture_dual_video.py), record whole
+pictures continuously with their times into recordings/ (every n s or every new pair, see recording.py), show the
 current moment on the build plate (space, see plate_plot.py), open the optical camera's own settings
 window (s), open the calibration and alignment windows. Everything the scripts print goes to the log at
 the bottom (and to the console).
@@ -24,6 +29,7 @@ window (record every n s goes on with the Areas window closed) and serves its HT
 Looks like the RAPTURE machine interface (the AMCF web client with its RAPTURE theme), see amcf_theme; every
 window has the same tab bar (Live, Calibration, Alignment, Areas) and state chips for the cameras.
 """
+import argparse
 import base64
 import functools
 import json
@@ -33,7 +39,6 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
 import tkinter as tk
 import tkinter.font as tkfont
 import traceback
@@ -53,7 +58,7 @@ from matplotlib.figure import Figure
 
 import dual_camera
 from area_history import delete_entry, draw_history, load_areas, load_history, thermal_average
-from camera_service import Service, serve
+from camera_service import HOST, RemoteService, Service, remember, serve
 from dual_camera import (BOARD_SQUARE, CALIBRATION_DIR, PICTURE_DIR, PLATE_R_INNER, PLATE_R_OUTER, VIEW_DIR,
                          _sample, align_view, calibrate_folder, load_pair, read_view, save_board_picture,
                          save_view)
@@ -357,6 +362,7 @@ class Log:
                 encoding = self.console.encoding or "ascii"
                 self.console.write(text.encode(encoding, "replace").decode(encoding))
         self.queue.put(text)
+        remember(text)                                 # for the API's GET /api/log
 
     def flush(self):
         if self.console is not None:
@@ -391,23 +397,25 @@ class App:
     """Main window: live view, pictures, recording, build plate view, optical settings; opens the calibration,
     alignment and areas windows."""
 
-    def __init__(self, root):
+    def __init__(self, root, connect=None, host=HOST):
+        """`connect` = the camera PC's address: work with the camera service running there (RemoteService);
+        else run the cameras here and serve the API on `host` (0.0.0.0 = for the network too)."""
         self.root = root
         self.log = Log(sys.stdout)
         sys.stdout = sys.stderr = self.log
         self.calls = queue.Queue()         # functions from worker threads, run in the Tk thread
-        self.service = Service()           # the cameras, recording, areas (camera_service.py)
-        self.cams = self.service.cams
-        self.recording_shown = None        # what the record buttons show
+        # the cameras, recording, areas (camera_service.py), here or on the camera PC
+        self.service = RemoteService(connect) if connect else Service()
+        self.recording_shown = None        # (clip / timelapse, recording pictures) as the buttons show it
         self.calibration = None            # the calibration window, while open
         self.alignment = None              # the alignment window, while open
         self.areas = None                  # the areas window, while open
-        self.shown = -1                    # cams.count of the picture on screen
-        self.rate = []                     # (time, cams.count), last few seconds: pictures per second
+        self.shown = -1                    # number of the live picture on screen
+        self.picture_every = tk.StringVar(value="1")   # s between recorded whole pictures (0 = every new one)
         self.chips = []                    # per window: its state chip labels (add_chips)
         self.chips_shown = None            # what they show
 
-        root.title("RAPTURE cameras")
+        root.title("RAPTURE cameras" + (f"  (cameras on {self.service.host})" if self.service.remote else ""))
         self.add_chips(toolbar(root, "Live", self.tabs()))
         page = ttk.Frame(root, style="Page.TFrame", padding=12)
         page.pack(fill="both", expand=True)
@@ -423,6 +431,17 @@ class App:
                        ttk.Button(buttons, text="Optical camera settings (S)", style="Minor.TButton",
                                   command=self.optical_settings)):
             button.pack(side="left", padx=(0, 8))
+        row = ttk.Frame(controls)                      # continuous recording of whole pictures (recording.py)
+        row.pack(fill="x", pady=(10, 0))
+        self.pictures_button = ttk.Button(row, command=self.record_pictures)
+        self.pictures_button.pack(side="left")
+        ttk.Label(row, text="every").pack(side="left", padx=(10, 4))
+        ttk.Entry(row, textvariable=self.picture_every, width=5).pack(side="left")
+        where = f"recordings/ on {self.service.host}" if self.service.remote else "recordings/"
+        ttk.Label(row, text=f"s (0 = every new picture): whole pictures with their times, into {where}").pack(
+            side="left", padx=(4, 0))
+        self.pictures_state = ttk.Label(row, style="Muted.TLabel")
+        self.pictures_state.pack(side="right")
         self.views = ttk.Label(controls, style="Muted.TLabel")
         self.views.pack(fill="x", pady=(10, 0))
         live = card(page, "Live view", fill="both", expand=True)
@@ -441,7 +460,8 @@ class App:
         self.update_buttons()
         self.views_changed()
         fit_to_screen(root)
-        self.server = serve(self.service)  # the same HTTP API as camera_service.py, while the app runs
+        # the same HTTP API as camera_service.py, while the app runs (not when using another PC's)
+        self.server = None if self.service.remote else serve(self.service, host)
         self.service.start()
         self.tick()
 
@@ -449,26 +469,22 @@ class App:
         while not self.calls.empty():
             self.calls.get()()
         self.log.show()
-        latest, count = self.cams.latest, self.cams.count
-        if latest is not None and count != self.shown:
-            self.shown = count
-            frame, recorder = latest[1], self.cams.recorder
-            if recorder is not None:
-                frame = frame.copy()
-                recorder.mark(frame)
-            self.preview_photo = photo(frame, area_size(self.preview_area, PREVIEW_SIZE))
+        shown = self.service.frame()                   # (number, side-by-side picture with the recording mark)
+        if shown is not None and shown[0] != self.shown:
+            self.shown = shown[0]
+            self.preview_photo = photo(shown[1], area_size(self.preview_area, PREVIEW_SIZE))
             self.preview.configure(image=self.preview_photo, text="")
-            now = time.monotonic()
-            self.rate = [(t, c) for t, c in self.rate if t > now - 5] + [(now, count)]
-            if len(self.rate) > 1:
-                (t0, c0), (t1, c1) = self.rate[0], self.rate[-1]
-                self.status.configure(text=f"{(c1 - c0) / (t1 - t0):.1f} pictures/s")
-        if not self.cams.is_alive():
-            self.status.configure(text="Cameras stopped (see log)")
         state = self.service.state()
+        self.status.configure(text="Cameras stopped (see log)" if state["thermal"] == "stopped" else
+                              f"{self.service.host} not reachable" if state["thermal"] == "unreachable" else
+                              f"{state['pictures_per_s']:.1f} pictures/s" + (f" on {self.service.host}" if self.service.remote else ""))
         self.update_chips(state)
-        if state["recording"] != self.recording_shown:     # also started / stopped through the API
-            self.update_buttons()
+        if (state["recording"], bool(state["pictures"])) != self.recording_shown:   # also changed through the API
+            self.update_buttons(state)
+        pictures = state["pictures"]
+        self.pictures_state.configure(text="" if not pictures else (
+            f"{pictures['saved']} saved in recordings/{pictures['folder']}/, {pictures['queued']} waiting"
+            + (f", {pictures['dropped']} DROPPED" if pictures["dropped"] else "")))
         if self.areas is not None:
             self.areas.poll(state)
         self.root.after(30, self.tick)
@@ -493,10 +509,12 @@ class App:
     def update_chips(self, state):
         """The state chips of all windows from service.state(): colour + symbol + text (never colour alone)."""
         look = {"live": ("ok", "✓"), "calibrating": ("info", "i"), "starting": ("off", "–"),
-                "not connected": ("off", "–"), "stopped": ("err", "!")}
+                "not connected": ("off", "–"), "stopped": ("err", "!"), "unreachable": ("err", "!")}
         states = tuple((look[state[name]][0], f"{look[state[name]][1]}  {name.upper()} {state[name].upper()}")
                        for name in CAMERAS)
-        states += (("ok", f"●  REC {state['recording'].upper()}") if state["recording"] else None,)
+        recording = [state["recording"].upper()] if state["recording"] else []
+        recording += ["PICTURES"] if state["pictures"] else []
+        states += (("ok", f"●  REC {' + '.join(recording)}") if recording else None,)
         if states == self.chips_shown:
             return
         self.chips_shown = states
@@ -521,31 +539,53 @@ class App:
         return self.service.take_picture()
 
     def record(self, timelapse):
-        """Start a clip / timelapse, or stop the one being recorded."""
-        self.service.record(None if self.cams.recorder is not None else timelapse)
-        self.update_buttons()
+        """Start a clip / timelapse, or stop the one being recorded (in a worker: maybe over the network)."""
+        kind = None if self.service.state()["recording"] else timelapse
+        self.work(lambda: self.service.record(kind), lambda _: self.update_buttons())
 
-    def update_buttons(self):
-        recorder = self.cams.recorder
-        self.recording_shown = None if recorder is None else "timelapse" if recorder.timelapse else "clip"
-        for button, timelapse, name in ((self.clip_button, False, "clip (R)"), (self.lapse_button, True, "timelapse (T)")):
-            mine = recorder is not None and recorder.timelapse == timelapse
+    def record_pictures(self):
+        """Start recording whole pictures (every n s, 0 = every new pair) or stop it (recording.py)."""
+        if self.service.state()["pictures"]:
+            every = None
+        else:
+            try:
+                every = float(self.picture_every.get())
+                if every < 0:
+                    raise ValueError
+            except ValueError:
+                print("Record pictures: every must be a number of seconds, 0 or more (0 = every new picture)")
+                return
+        self.pictures_button.state(["disabled"])       # stopping writes what is still waiting first
+        self.work(lambda: self.service.record_pictures(every), lambda _: self.update_buttons())
+
+    def update_buttons(self, state=None):
+        state = state or self.service.state()
+        recording, pictures = state["recording"], state["pictures"]
+        self.recording_shown = (recording, bool(pictures))
+        for button, kind, name in ((self.clip_button, "clip", "clip (R)"), (self.lapse_button, "timelapse", "timelapse (T)")):
+            mine = recording == kind
             button.configure(text=f"■  Stop {name}" if mine else f"●  Record {name}",
                              style="Danger.TButton" if mine else "TButton")
-            button.state(["disabled"] if recorder is not None and not mine else ["!disabled"])
+            button.state(["disabled"] if recording and not mine else ["!disabled"])
+        self.pictures_button.configure(text="■  Stop recording pictures" if pictures else "●  Record pictures",
+                                       style="Danger.TButton" if pictures else "TButton")
+        self.pictures_button.state(["!disabled"])
 
     def plate(self, pair=None, optical_view=None):
         """`pair` (default: the current moment) on the build plate, in its own window, through the views in
         use or `optical_view` for the optical picture. The resampling runs in the background."""
-        if pair is None and self.cams.latest is not None:
-            pair = self.cams.latest[0]
-        if pair is None or self.plate_button.instate(["disabled"]):
+        if self.plate_button.instate(["disabled"]):
             return
         note = ("   (optical view of the alignment window, not saved)"
                 if optical_view not in (None, dual_camera.OPTICAL_VIEW) else "")
         self.plate_button.state(["disabled"])
         print("Build plate view: putting the pictures on the plate (takes a few seconds) ...")
-        self.work(lambda: plate_layers(pair, optical_view), lambda layers: self.plate_window(pair, layers, note))
+
+        def job():                                     # the current moment: maybe fetched over the network
+            shown = pair or self.service.pair()
+            return None if shown is None else (shown, plate_layers(shown, optical_view))
+
+        self.work(job, lambda result: self.plate_window(*(result or (None, None)), note))
 
     def plate_window(self, pair, layers, note=""):
         self.plate_button.state(["!disabled"])
@@ -565,8 +605,6 @@ class App:
         canvas.get_tk_widget().focus_set()         # space switches which camera lies on top
 
     def optical_settings(self):
-        if dual_camera.WINDOWS:                  # Linux: a program of its own, the live view keeps running
-            print("Optical camera settings window: the live view pauses until it is closed")
         self.service.optical_settings()
 
     def open_calibration(self):
@@ -584,6 +622,11 @@ class App:
             self.alignment.win.lift()
 
     def open_areas(self):
+        if self.service.remote:
+            print(f"The Areas window works where the cameras are ({self.service.host}: its areas/ folder, record "
+                  "every n s there). Here: open the app on that PC, use its API, or process a picture recording "
+                  "afterwards (python recording.py ... --areas)")
+            return
         if self.areas is None:
             self.areas = Areas(self)
         else:
@@ -842,14 +885,14 @@ class Calibration:
             self.show()
 
     def take(self):
-        latest = self.app.cams.latest
-        if latest is None:
+        pair = self.app.service.pair()                 # with --connect: fetched from the camera PC
+        if pair is None:
             print("No picture from the cameras yet")
             return
         if self.folder is None:
             self.folder = CALIBRATION_DIR / f"{datetime.now():%Y-%m-%d_%H-%M-%S}"
         number = max((n for n, _, _ in self.pictures(CAMERAS)), default=0) + 1
-        stored = save_board_picture(self.folder, number, latest[0], self.cameras())
+        stored = save_board_picture(self.folder, number, pair, self.cameras())
         if not stored:
             print("No picture taken: the selected camera(s) deliver nothing, or the thermal camera still calibrates")
             return
@@ -903,7 +946,7 @@ class Calibration:
         except ValueError:
             square = 0
         if not square > 0:
-            messagebox.showerror("Calibration", "Checkerboard square: the side of one square in mm, e.g. 5",
+            messagebox.showerror("Calibration", "Checkerboard square: the side of one square in mm, e.g. 8",
                                  parent=self.win)
             return
         for button in self.buttons:
@@ -1446,8 +1489,8 @@ class Areas:
               "history; click the time plot or use the arrow buttons / keys for one picture of it.")
         self.refresh()
         self.redraw_plate()
-        if app.cams.latest is not None:
-            self.show_plate(app.cams.latest[0])
+        if app.service.pair() is not None:
+            self.show_plate(app.service.pair())
 
     def areas_panel(self, box):
         frame = ttk.Frame(box)
@@ -1627,11 +1670,11 @@ class Areas:
 
     # Pictures into the areas -----------------------------------------------------------------------------
     def take(self):
-        latest = self.app.cams.latest
-        if latest is None:
+        pair = self.app.service.pair()
+        if pair is None:
             print("No picture from the cameras yet")
         else:
-            self.put([latest[0]], plate=True)
+            self.put([pair], plate=True)
 
     def add_saved(self):
         chosen = filedialog.askopenfilenames(parent=self.win, title="Pictures to put into all areas",
@@ -1861,12 +1904,18 @@ def main():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except (AttributeError, OSError):
         pass
+    parser = argparse.ArgumentParser(description="RAPTURE cameras: live view, recording, calibration, alignment, areas.")
+    parser.add_argument("--connect", metavar="CAMERA_PC", help="use the camera service on another computer "
+                        "(address[:port]) instead of cameras connected here")
+    parser.add_argument("--host", default=HOST, help="address the API listens on; 0.0.0.0 = from the network too "
+                                                     "(default: this PC only)")
+    args = parser.parse_args()
     root = tk.Tk()
     dpi = re.search(r"^Xft\.dpi:\s*([\d.]+)", x11("xrdb", "-query"), re.MULTILINE)
     if dpi:          # Linux: Tk ignores the desktop's display scaling; GNOME and KDE give it as Xft.dpi (96 = 100%)
         root.tk.call("tk", "scaling", float(dpi.group(1)) / 72)    # fonts and amcf_theme's `unit` follow it
     amcf_theme(root)
-    App(root)
+    App(root, args.connect, args.host)
     root.mainloop()
 
 

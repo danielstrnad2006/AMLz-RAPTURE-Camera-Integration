@@ -31,6 +31,7 @@ From your own code (images are plain OpenCV / NumPy arrays):
         pair.optical      # BGR uint8
         pair.thermal_live, pair.optical_live    # False for placeholder pictures
         pair.timestamp                          # time.time() when the pair was taken
+        pair.thermal_time, pair.optical_time    # time.time() when each camera's frame arrived (NaN: unknown)
         pair.rotation                           # deg the build plate had turned then (0 until the PLC tells)
         pair.temperature(x, y), pair.colour(x, y)   # at build plate point(s) x', y' in mm
     save_pair(pair) -> pictures/<time>.png,  load_pair(path) -> the FramePair again (no cameras needed)
@@ -163,15 +164,17 @@ def turn(xy, deg):
     xy = np.asarray(xy, float)
     return np.stack([c * xy[..., 0] - s * xy[..., 1], s * xy[..., 0] + c * xy[..., 1]], -1)
 
-BOARD_SQUARE = 5.00                      # mm, side of one calibration checkerboard square
+BOARD_SQUARE = 8.00                      # mm, side of one square of the engraved calibration board
 CALIBRATION_DIR = Path(__file__).resolve().parent / "calibration"   # checkerboard pictures, one folder per session
 VIEW_DIR = Path(__file__).resolve().parent / "views"                # thermal.json, optical.json: the views in use
 PICTURE_DIR = Path(__file__).resolve().parent / "pictures"          # pairs stored by save_pair (app.py: p)
 # The views in use come from views/<camera>.json (written by app.py: Calibration). These defaults apply
-# only if a file is missing: center and omega measured by hand, size and dist from calibrate_view().
-THERMAL_VIEW = load_view("thermal", View(size=(115.5, 86.5), center=(-5.86124587, 57.00031636), omega=280))
-OPTICAL_VIEW = load_view("optical", View(size=(88.209, 66.02), center=(-56.46213605, 27.8451025), omega=320,
-                                         dist=(-0.030203, 0.014376, 0.000732, 9.4e-05, -0.006925)))
+# only if a file is missing: the views of 2026-11-25 (8 mm board, optical aligned to thermal, both then
+# turned 90 deg counter-clockwise about the plate centre).
+THERMAL_VIEW = load_view("thermal", View(size=(90.636, 67.441), center=(-57.0, -5.861), omega=190,
+                                         dist=(-0.006422, 0.00061, -0.000135, -0.000114, 0.001731)))
+OPTICAL_VIEW = load_view("optical", View(size=(84.245, 63.181), center=(-22.7442, -50.4373), omega=50.2837,
+                                         dist=(-0.024221, -0.000281, 0.000245, -0.000783, 0.000462)))
 
 
 def placeholder(title, size=(640, 480)):
@@ -191,10 +194,19 @@ class FramePair:
     thermal_live: bool
     optical_live: bool
     rotation: float = 0.0    # deg the build plate had turned (counter-clockwise seen from above) when taken
+    thermal_time: float = math.nan     # time.time() when each camera's frame arrived from the camera
+    optical_time: float = math.nan     # (the frames of one pair are up to a frame interval apart)
+    thermal_rotation: float | None = None   # the plate rotation when each camera's frame was taken, where
+    optical_rotation: float | None = None   # known separately (recording.py, from an AMCF angle log); else rotation
 
-    def seen_at(self, x, y):
-        """Where the cameras saw build plate point(s) (x', y') mm: the points turned by self.rotation."""
-        there = turn(np.stack(np.broadcast_arrays(x, y), -1), self.rotation)
+    def turned(self, camera):
+        """deg the plate had turned when `camera`'s frame was taken ("thermal" / "optical")."""
+        own = self.thermal_rotation if camera == "thermal" else self.optical_rotation
+        return self.rotation if own is None else own
+
+    def seen_at(self, x, y, camera="thermal"):
+        """Where `camera` saw build plate point(s) (x', y') mm: the points turned by its rotation."""
+        there = turn(np.stack(np.broadcast_arrays(x, y), -1), self.turned(camera))
         return there[..., 0], there[..., 1]
 
     def temperature(self, x, y):
@@ -205,7 +217,7 @@ class FramePair:
     def colour(self, x, y):
         """Optical BGR (float32, last axis 3) at build plate point(s) (x', y') mm, interpolated from the
         original optical picture. NaN where the optical camera does not see the point."""
-        bgr = _sample(self.optical, *OPTICAL_VIEW.to_pixel(*self.seen_at(x, y), self.optical.shape))
+        bgr = _sample(self.optical, *OPTICAL_VIEW.to_pixel(*self.seen_at(x, y, "optical"), self.optical.shape))
         if not self.optical_live:
             bgr[...] = np.nan
         return bgr
@@ -239,6 +251,7 @@ class Thermal(otc.IRImagerClient if otc else object):
         self.connected = False
         self._lock = threading.Lock()
         self._event = None
+        self._time = math.nan                       # time.time() when the latest frame arrived
         self._imager = otc.IRImagerFactory.getInstance().create("native")
         self._imager.addClient(self)
         try:
@@ -256,6 +269,7 @@ class Thermal(otc.IRImagerClient if otc else object):
     def onFrame(self, evt):                         # called by the SDK for every new frame
         with self._lock:
             self._event = evt.clone()               # the SDK reuses evt once this returns
+            self._time = time.time()
 
     def onConnection(self, evt):                    # called by the SDK when the connection changes
         if evt.state == otc.ConnectionState_Lost or evt.state == otc.ConnectionState_Timeout:
@@ -263,11 +277,12 @@ class Thermal(otc.IRImagerClient if otc else object):
             self._imager.disconnect()
 
     def read(self):
-        """Latest frame as (false-colour BGR picture, temperatures in deg C), or (None, None)."""
+        """Latest frame as (false-colour BGR picture, temperatures in deg C, time.time() it arrived), or
+        (None, None, NaN)."""
         with self._lock:
-            event = self._event
+            event, arrived = self._event, self._time
         if not self.connected or event is None or event.thermalFrame.isEmpty():
-            return None, None
+            return None, None, math.nan
         self._builder.setThermalFrame(thermalFrame=event.thermalFrame)
         self._builder.convertTemperatureToPaletteImage()
         h, w = self._builder.getHeight(), self._builder.getWidth()
@@ -278,7 +293,7 @@ class Thermal(otc.IRImagerClient if otc else object):
         temps = temps.reshape(h, w)
         if "initializing" in otc.flagStateToString(event.meta.getFlagState()).lower():
             temps[:] = np.nan                       # start-up calibration: temperatures unreliable
-        return image, temps
+        return image, temps, arrived
 
     def close(self):
         self.connected = False
@@ -359,15 +374,16 @@ class CameraRig:
 
     def grab(self) -> FramePair:
         """Latest image from each camera. A missing or failed camera gives a placeholder."""
-        optical = None
+        optical, optical_time = None, math.nan
         if self.optical is not None:
-            ok, optical = self.optical.read()
+            ok, optical = self.optical.read()     # waits for the next frame
+            optical_time = time.time()
             if not ok:        # unplugged while running
                 optical = None
                 self.optical.release()
                 self.optical = None
         # Thermal after optical: the optical read waits for a new frame, so the thermal frame is the freshest.
-        t_image, t_deg = self.thermal.read() if self.thermal is not None else (None, None)
+        t_image, t_deg, thermal_time = self.thermal.read() if self.thermal is not None else (None, None, math.nan)
         thermal_live = t_image is not None
         if ROTATE_180:                       # live pictures only, placeholders stay readable
             optical = None if optical is None else cv2.rotate(optical, cv2.ROTATE_180)
@@ -383,6 +399,8 @@ class CameraRig:
             optical=optical if optical is not None else self._placeholders[1].copy(),
             thermal_live=thermal_live,
             optical_live=optical is not None,
+            thermal_time=thermal_time if thermal_live else math.nan,
+            optical_time=optical_time if optical is not None else math.nan,
         )
 
     def optical_settings(self):
@@ -460,7 +478,44 @@ def calibrate_view(view, pictures, square=BOARD_SQUARE, marked=None, report=None
         if not ok:
             print(f"Picture {number}: {text}")
 
-    boards, used = [], []                          # per picture: corners in board mm, in pixels; its mark
+    def without_lines(gray, width):                   # bright / dark lines up to `width` px wide wiped out
+        k = 2 * round(width / 2) + 1                  # (the engraved outlines between the squares, scratches)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        return cv2.morphologyEx(cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel), cv2.MORPH_CLOSE, kernel)
+
+    def refine(img, corner, step):                    # where the board's edges through `corner` cross, or None
+        # The four edges leaving a corner are measured from 0.2 to 0.8 squares away from it, leaving out the
+        # crossing itself (the engraved outlines meet there in a blob or with a jog). Opposite edges are
+        # fitted with one straight line, so a jog is averaged out; the corner is where the two lines cross.
+        size = np.hypot(*step)
+        t = np.r_[-np.linspace(0.8, 0.2, 7), np.linspace(0.2, 0.8, 7)] * size    # along the edges, px
+        s = np.arange(-0.3 * size, 0.3 * size, 0.5)                                # across them
+        lines = []
+        for d in (step / size, np.array([-step[1], step[0]]) / size):
+            n = np.array([-d[1], d[0]])
+            xy = (corner + t[:, None, None] * d + s[None, :, None] * n).astype(np.float32)
+            grad = np.abs(np.diff(cv2.remap(img, xy[..., 0], xy[..., 1], cv2.INTER_LINEAR), axis=1))
+            i = grad.argmax(1).clip(1, grad.shape[1] - 2)
+            a, b, c = (grad[np.arange(len(t)), i + k] for k in (-1, 0, 1))
+            off = np.where(a - 2 * b + c < 0, 0.5 * (a - c) / np.minimum(a - 2 * b + c, -1e-9), 0)
+            p = corner + t[:, None] * d + (s[i] + 0.25 + 0.5 * off)[:, None] * n     # the steepest point
+            keep = inside = ((xy >= 0) & (xy <= np.array(img.shape[::-1]) - 1)).all((1, 2))   # profile in the picture
+            for _ in range(3):                        # straight line, points off it (scratches, seams) dropped
+                if (keep & (t < 0)).sum() < 3 or (keep & (t > 0)).sum() < 3:
+                    return None
+                mid = p[keep].mean(0)
+                u = np.linalg.svd(p[keep] - mid)[2][0]
+                off = np.abs((p - mid) @ np.array([-u[1], u[0]]))
+                keep = inside & (off < max(0.02 * size, 3 * np.median(off[keep])))
+            if (keep & (t < 0)).sum() < 3 or (keep & (t > 0)).sum() < 3:
+                return None
+            lines.append((mid, u))
+        (m1, u1), (m2, u2) = lines
+        k = np.linalg.solve(np.c_[u1, -u2], m2 - m1)[0]
+        corner_new = m1 + k * u1
+        return corner_new if np.hypot(*(corner_new - corner)) < 0.15 * size else None
+
+    boards, used, warned = [], [], False           # per picture: corners in board mm, in pixels; its mark
     for number, pic in enumerate(pictures, 1):
         gray = pic if pic.ndim == 2 else cv2.cvtColor(pic, cv2.COLOR_BGR2GRAY)
         if gray.dtype != np.uint8:                    # temperatures: 1%..99% -> 0..255, hot/cold spots clipped
@@ -478,6 +533,8 @@ def calibrate_view(view, pictures, square=BOARD_SQUARE, marked=None, report=None
         small = cv2.resize(gray, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_AREA) if zoom < 1 else gray
         # Square size from the strongest repetition in the picture centre (noise has none): a
         # checkerboard's strongest Fourier component runs diagonally, with period sqrt(2) x square.
+        # The outlines are wiped out first: their grid repeats every square, which could be taken for it.
+        small = without_lines(small, 4)
         n = min(small.shape)
         y0, x0 = (small.shape[0] - n) // 2, (small.shape[1] - n) // 2
         crop = small[y0:y0 + n, x0:x0 + n].astype(np.float32)
@@ -486,6 +543,12 @@ def calibrate_view(view, pictures, square=BOARD_SQUARE, marked=None, report=None
         freq = np.hypot(*np.meshgrid(np.fft.fftfreq(n), np.fft.fftfreq(n)))   # cycles per px
         power[(freq < 4 / n) | (freq > 1 / 8)] = 0                            # periods 8 px .. n/4
         size = 1 / freq.flat[power.argmax()] / np.sqrt(2)
+        expected = square * w / view.size[0]          # px, with the view in use
+        if not warned and not 0.8 < size / zoom / expected < 1.25:
+            warned = True
+            print(f"Picture {number}: squares of ~{size / zoom:.0f} px, but with {square:g} mm squares the view in use "
+                  f"expects ~{expected:.0f} px. Is the square size right?")
+        small = without_lines(small, 0.08 * size)
         # Smoothed by a tenth of a square (removes pixel noise, keeps the corners) and the contrast evened
         # out over about a square (board warmer in one place than another, uneven light); the +2 grey
         # levels keep areas without a board from being amplified to full contrast.
@@ -527,25 +590,55 @@ def calibrate_view(view, pictures, square=BOARD_SQUARE, marked=None, report=None
             verdict(mark, number, f"left out: no 2x2 checkerboard corners near the centre "
                                   f"(square ~{size / zoom:.0f} px)")
             continue
-        todo = list(found)
-        while todo:
-            r, c = todo.pop()
-            for dr, dc in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-                new, back = (r + dr, c + dc), (r - dr, c - dc)
-                if new in found or back not in found:
+        # Grown from there: every corner up to two squares away from the ones found is predicted from
+        # the nearest found ones (a local affine fit, so the lens distortion hardly matters) and refined.
+        # Two squares, so a corner that cannot be found (the hole, glare, an engraving seam) does not
+        # stop the growth. A corner is tried again once more of its neighbours have been found.
+        tried = {}                                    # cell -> neighbours found when it was last tried
+        while True:
+            cells, pts = np.array(list(found)), np.array(list(found.values()))
+            todo = []
+            for cell in {(r + dr, c + dc) for r, c in found for dr in range(-2, 3) for dc in range(-2, 3)} - set(found):
+                nb = int((np.abs(cells - cell).max(1) == 1).sum())
+                if tried.get(cell, -1) < nb:
+                    todo.append((-nb, cell))
+            added = False
+            for nb, cell in sorted(todo):
+                near = np.argsort(np.abs(cells - cell).max(1), kind="stable")[:8]
+                a = np.c_[cells[near], np.ones(len(near))]
+                if np.linalg.matrix_rank(a) < 3:
                     continue
-                step = found[r, c] - found[back]
-                corner = corner_near(small, strong, peaks, found[r, c] + step, step)
+                tried[cell] = -nb
+                m = np.linalg.lstsq(a, pts[near], rcond=None)[0]   # rows: one row down, one column right, offset
+                corner = corner_near(small, strong, peaks, np.array([*cell, 1.0]) @ m, m[1])
                 if corner is not None:
-                    found[new] = corner
-                    todo.append(new)
-        if zoom < 1:                                  # refine in the full picture
-            win = max(2, int(0.25 * size / zoom))
-            full = {rc: (p + 0.5) / zoom - 0.5 for rc, p in found.items()}
-            pix = cv2.cornerSubPix(gray, np.array(list(full.values()), np.float32).reshape(-1, 1, 2), (win, win),
-                                   (-1, -1), (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 40, 0.001))
-            found = {rc: p.astype(float) for (rc, guess), p in zip(full.items(), pix[:, 0])
-                     if np.hypot(*(p - guess)) < 2 / zoom}
+                    found[cell], added = corner, True
+            if not added:
+                break
+        # Refined in the full picture from the edges (one square along a row from an affine fit of all).
+        cells, pts = np.array(list(found)), np.array(list(found.values()))
+        step = np.linalg.lstsq(np.c_[cells, np.ones(len(cells))], pts, rcond=None)[0][1] / zoom
+        img = cv2.GaussianBlur(without_lines(gray, 0.08 * size / zoom).astype(np.float32), (0, 0), 0.02 * size / zoom)
+        full = {rc: refine(img, (p + 0.5) / zoom - 0.5, step) for rc, p in found.items()}
+        found = {rc: p for rc, p in full.items() if p is not None}
+        # Each corner must sit where its nearest neighbours put it (local affine fit, within 5% of a square):
+        # noise or a scratch taken for a corner does not. The worst one is dropped until all agree.
+        while len(found) > 4:
+            cells, pts = np.array(list(found)), np.array(list(found.values()))
+            err = np.full(len(cells), np.inf)
+            for i, cell in enumerate(cells):
+                gap = np.abs(cells - cell).max(1)
+                gap[i] = 1 << 30
+                near = np.argsort(gap, kind="stable")[:8]
+                a = np.c_[cells[near], np.ones(len(near))]
+                if np.linalg.matrix_rank(a) == 3:
+                    err[i] = np.hypot(*(np.array([*cell, 1.0]) @ np.linalg.lstsq(a, pts[near], rcond=None)[0] - pts[i]))
+            if err.max() < 0.05 * size / zoom:
+                break
+            del found[tuple(cells[err.argmax()])]
+        if len(found) < 4:
+            verdict(mark, number, f"left out: corners not confirmed by the edges (square ~{size / zoom:.0f} px)")
+            continue
         for (r, c), p in found.items():
             for n in ((r, c + 1), (r + 1, c)):
                 if n in found:
@@ -607,7 +700,7 @@ def calibrate_view(view, pictures, square=BOARD_SQUARE, marked=None, report=None
         return p, np.hypot(*e.reshape(-1, 2).T)
 
     p, err = fit(np.array(start))
-    keep = err < max(1.0, 5 * np.median(err))         # drop mis-found corners (glare, dirt) and refit
+    keep = err < max(1.0, 3 * np.median(err))         # drop mis-found corners (glare, seams, dirt) and refit
     if not keep.all():
         keep = np.split(keep, np.cumsum([len(xy) for xy, _ in boards])[:-1])
         boards = [(xy[k], pix[k]) for (xy, pix), k in zip(boards, keep)]
@@ -671,15 +764,17 @@ def save_board_picture(folder, number, pair, cameras=("thermal", "optical")):
 def save_pair(pair, folder=None):
     """Store `pair` in pictures/ (or `folder`) as <time>.png (side by side, to look at) and the original
     pictures for processing: <time>_thermal.npy (= thermal_c, deg C), <time>_thermal.png (false colours),
-    <time>_optical.png; only the cameras that deliver; <time>.json = the plate rotation. Returns the path
-    of <time>.png (see load_pair)."""
+    <time>_optical.png; only the cameras that deliver; <time>.json = the plate rotation and the times
+    (timestamp, when each camera's frame arrived; unix s). Returns the path of <time>.png (see load_pair)."""
     folder = folder or PICTURE_DIR
     folder.mkdir(parents=True, exist_ok=True)
     stem = base = f"{datetime.fromtimestamp(pair.timestamp):%Y-%m-%d_%H-%M-%S}"
     while (folder / f"{stem}.png").exists():          # more than one in a second
         stem = f"{base}_{int(stem[len(base) + 1:] or 1) + 1}"
     cv2.imwrite(str(folder / f"{stem}.png"), side_by_side(pair))
-    (folder / f"{stem}.json").write_text(json.dumps({"rotation_deg": pair.rotation}), encoding="utf-8")
+    times = {k: getattr(pair, k) for k in ("timestamp", "thermal_time", "optical_time")}
+    (folder / f"{stem}.json").write_text(json.dumps({"rotation_deg": pair.rotation, **{
+        k: None if math.isnan(t) else round(t, 6) for k, t in times.items()}}), encoding="utf-8")
     if pair.thermal_live:
         np.save(folder / f"{stem}_thermal.npy", pair.thermal_c)
         cv2.imwrite(str(folder / f"{stem}_thermal.png"), pair.thermal)
@@ -690,8 +785,8 @@ def save_pair(pair, folder=None):
 
 def load_pair(path):
     """The FramePair stored by save_pair; `path` = its <time>.png or any file stored with it. A camera
-    not stored gives a placeholder, as in CameraRig.grab(). Timestamp from the file name (to the second),
-    rotation from <time>.json (0 if there is none)."""
+    not stored gives a placeholder, as in CameraRig.grab(). Rotation and times from <time>.json (older
+    pairs: rotation 0 if there is none, timestamp from the file name, to the second)."""
     path = Path(path)
     stem = path.stem.removesuffix("_thermal").removesuffix("_optical").removesuffix("_points")
     files = {end: path.with_name(f"{stem}{end}") for end in ("_thermal.npy", "_thermal.png", "_optical.png", ".json")}
@@ -702,11 +797,12 @@ def load_pair(path):
         timestamp = datetime.strptime(stem[:19], "%Y-%m-%d_%H-%M-%S").timestamp()
     except ValueError:                                # renamed
         timestamp = path.stat().st_mtime
-    return FramePair(timestamp, thermal,
+    info = json.loads(files[".json"].read_text(encoding="utf-8")) if files[".json"].exists() else {}
+    times = {k: math.nan if info.get(k) is None else info[k] for k in ("thermal_time", "optical_time")}
+    return FramePair(info.get("timestamp") or timestamp, thermal,
                      np.load(files["_thermal.npy"]) if thermal_live else np.full(thermal.shape[:2], np.nan, np.float32),
                      cv2.imread(str(files["_optical.png"])) if optical_live else placeholder("Optical: MOKOSE UC50"),
-                     thermal_live, optical_live, json.loads(files[".json"].read_text(encoding="utf-8"))["rotation_deg"]
-                     if files[".json"].exists() else 0.0)
+                     thermal_live, optical_live, info.get("rotation_deg", 0.0), **times)
 
 
 def align_view(view, pixels, shape, plate, zoom=False):

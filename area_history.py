@@ -129,14 +129,15 @@ def map_area(pair, area):
         if not live or (camera == "thermal" and np.isnan(picture).all()):
             continue
         view = dual_camera.THERMAL_VIEW if camera == "thermal" else dual_camera.OPTICAL_VIEW
-        picture_at = turn(picture_outline(view, picture.shape[:2]), -pair.rotation)   # in the plate's frame
+        rotation = pair.turned(camera)                               # when this camera's frame was taken
+        picture_at = turn(picture_outline(view, picture.shape[:2]), -rotation)   # in the plate's frame
         corners = np.array(area["corners"], float)
         if ((picture_at.min(0) > corners.max(0)) | (picture_at.max(0) < corners.min(0))).any():
             continue                                                 # bounding boxes apart: not in the picture
         xs, ys, inside = area_grid(area, camera)
         blocks = []
         for rows in np.array_split(ys, max(1, len(ys) // 200)):             # in blocks: less memory
-            there = turn(np.stack(np.meshgrid(xs, rows), -1), pair.rotation)    # where the cameras saw it
+            there = turn(np.stack(np.meshgrid(xs, rows), -1), rotation)    # where the camera saw it
             blocks.append(_sample(picture, *view.to_pixel(there[..., 0], there[..., 1], picture.shape)))
         values = np.concatenate(blocks)
         seen = inside & ~np.isnan(values if values.ndim == 2 else values[..., 0])

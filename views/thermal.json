@@ -1,28 +1,29 @@
 {
   "size": [
-    90.317,
-    67.213
+    90.636,
+    67.441
   ],
   "center": [
-    -5.861,
-    57.0
+    -57.0,
+    -5.861
   ],
-  "omega": 100.0,
+  "omega": 190.0,
   "dist": [
-    -0.011691,
-    0.00964,
-    -0.000174,
-    0.00033,
-    -0.003025
+    -0.006422,
+    0.00061,
+    -0.000135,
+    -0.000114,
+    0.001731
   ],
-  "folder": "2026-11-17_11-43-43",
-  "square_mm": 12.0,
-  "pictures_used": 6,
-  "pictures": 6,
-  "corners": 178,
-  "rms_px": 0.953,
-  "rms_mm": 0.1345,
-  "max_px": 3.862,
-  "reach": 0.652,
-  "saved": "2026-11-17 12:03:17"
+  "folder": "2026-11-25_14-52-06",
+  "square_mm": 8.0,
+  "pictures_used": 24,
+  "pictures": 24,
+  "corners": 1571,
+  "rms_px": 0.185,
+  "rms_mm": 0.0262,
+  "max_px": 0.863,
+  "reach": 0.756,
+  "saved": "2026-11-25 14:54:48",
+  "moved": "center and omega turned 90 deg counter-clockwise about the plate centre on 2026-11-25 (were [-5.861, 57.0], 100.0)"
 }

@@ -2,30 +2,42 @@
 camera_service.py - the cameras as a background service with an HTTP API (no window needed).
 
 Run:  python camera_service.py [--host 0.0.0.0] [--port 8765]     (Ctrl+C stops it)
-      app.py runs the same service inside itself and serves the same API while its windows are open.
-      Only one program can use the cameras: run either this or app.py.
+      app.py runs the same service inside itself and serves the same API while its windows are open
+      (python app.py --host 0.0.0.0 to reach it from the network). Only one program can use the
+      cameras: run either this or app.py.
+Remote: python app.py --connect <camera PC>[:port] works with the service on another computer
+      (RemoteService): live picture, state and log over the network; pictures taken by hand are
+      fetched and stored on this computer; clips and picture recordings stay on the camera PC.
 
 The Service owns the cameras (grabbing continuously in a thread of its own) and does everything that has to
-go on without anyone watching: pictures, clips / timelapses, putting pictures into the areas, "record
-every n s", the plate rotation for the next pictures (by hand now, later from the PLC).
+go on without anyone watching: pictures, clips / timelapses, continuous recording of whole pictures
+(recording.py), putting pictures into the areas, "record every n s", the plate rotation for the next
+pictures (by hand now, later from the PLC).
 
 HTTP API (JSON in and out; NaN = null). By default only reachable from this PC (127.0.0.1); --host 0.0.0.0
 opens it to the network. There is no login: whoever reaches it can record and create areas.
     GET  /api/state                   cameras, recording, areas recording, rotation
     GET  /api/live.jpg                the live side-by-side picture
     GET  /api/live.mjpg               the same as a stream (open it in a browser)
+    GET  /api/pair                    the latest picture pair, whole (NumPy .npz: thermal, thermal_c, optical,
+                                      meta = JSON with timestamp, live flags, rotation, arrival times)
+    GET  /api/log?after=n             what the service printed: {"next": n, "lines": [...]}
     GET  /api/temperature?x=&y=       deg C at build plate point x', y' mm, now
     GET  /api/areas                   the areas (corners in plate mm, pictures, last mean deg C)
     GET  /api/areas/<name>            one area and its history
     POST /api/picture                 take a picture into pictures/
     POST /api/record                  {"kind": "clip" | "timelapse"}: start recording
     POST /api/record/stop
+    POST /api/pictures/record         {"every_s": n}: record whole pictures into recordings/ (0 = every new pair)
+    POST /api/pictures/stop
     POST /api/areas                   {"name": ..., "corners": [[x', y'], ...]}: a new area (2 corners = a rectangle)
     POST /api/areas/record            the current moment into all areas
     POST /api/areas/every             {"seconds": n}: into all areas every n s; 0 or null = stop
     POST /api/rotation                {"deg": d}: the plate rotation for the pictures from now on
 """
 import argparse
+import collections
+import io
 import json
 import math
 import sys
@@ -37,15 +49,43 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
 
 from area_history import load_areas, load_history, new_area, record
 from capture_dual_video import Recorder
-from dual_camera import CameraRig, load_pair, save_pair, side_by_side
+from dual_camera import CameraRig, FramePair, load_pair, save_pair, side_by_side
+from recording import PictureRecorder
 
 HOST, PORT = "127.0.0.1", 8765
+LOG = collections.deque(maxlen=2000)   # (number, line) of what was printed, for GET /api/log
+_log = {"count": 0, "partial": "", "lock": threading.Lock()}
+
+
+def remember(text):
+    """Keep printed text, line by line, for GET /api/log (app.py's log and the headless service call it)."""
+    with _log["lock"]:
+        lines = (_log["partial"] + text).split("\n")
+        _log["partial"] = lines.pop()
+        for line in lines:
+            _log["count"] += 1
+            LOG.append((_log["count"], line))
+
+
+class Tee:
+    """stdout / stderr of the headless service: to the console and to remember()."""
+
+    def __init__(self, console):
+        self.console = console
+
+    def write(self, text):
+        self.console.write(text)
+        remember(text)
+
+    def flush(self):
+        self.console.flush()
 
 
 class Cameras(threading.Thread):
@@ -60,6 +100,8 @@ class Cameras(threading.Thread):
         self.calibrating = False           # the thermal camera of the last grab calibrates (no temperatures)
         self.rate = 0.0                    # grabs per second over the last 5 s
         self.recorder = None               # capture_dual_video.Recorder while recording
+        self.pictures = None               # recording.PictureRecorder while recording whole pictures
+        self.rotation = 0.0                # deg the plate is turned by: given to every pair grabbed
         self.jobs = []                     # functions f(rig) to run in this thread, e.g. the settings window
         self.stopping = False
 
@@ -70,11 +112,13 @@ class Cameras(threading.Thread):
                 while not self.stopping:
                     while self.jobs:
                         self.jobs.pop(0)(rig)
-                    pair = rig.grab()
+                    pair = replace(rig.grab(), rotation=self.rotation)
                     frame = side_by_side(pair)
                     with self.lock:
                         if self.recorder is not None:
                             self.recorder.add(pair, frame)
+                        if self.pictures is not None:
+                            self.pictures.add(pair)
                         self.calibrating = pair.thermal_live and bool(np.isnan(pair.thermal_c).all())
                         self.latest, self.count = (pair, frame), self.count + 1
                     now = time.monotonic()
@@ -90,14 +134,18 @@ class Cameras(threading.Thread):
                 if self.recorder is not None:
                     self.recorder.stop()
                     self.recorder = None
+                if self.pictures is not None:
+                    self.pictures.stop()
+                    self.pictures = None
 
 
 class Service:
     """The cameras and what is done with them, for app.py and the HTTP API alike (thread-safe)."""
 
+    remote = False
+
     def __init__(self):
         self.cams = Cameras()
-        self.rotation = 0.0                # deg the plate is turned by, for the pictures from now on
         self.keep = False                  # also keep the whole pictures of what goes into the areas
         self.every = None                  # s between pictures into the areas while "record every" is on
         self.areas_changed = 0             # counts changes of the areas / their histories (windows refresh)
@@ -105,7 +153,17 @@ class Service:
         self._wake = threading.Event()     # wakes the "record every" thread
         self._every_thread = None
         self._jpeg = (-1, b"")             # (cams.count, JPEG of that live picture)
+        self._frame = (-1, None)           # (cams.count, live picture with the recording mark)
         self.closing = False
+
+    @property
+    def rotation(self):
+        """deg the plate is turned by, for the pictures from now on."""
+        return self.cams.rotation
+
+    @rotation.setter
+    def rotation(self, deg):
+        self.cams.rotation = float(deg)
 
     def start(self):
         self.cams.start()
@@ -116,9 +174,22 @@ class Service:
         latest = self.cams.latest
         return latest[0] if latest else None
 
+    def frame(self):
+        """(number, the latest side-by-side picture with the recording mark), None before the first grab."""
+        latest, count, recorder = self.cams.latest, self.cams.count, self.cams.recorder
+        if latest is None:
+            return None
+        if self._frame[0] != count:
+            frame = latest[1]
+            if recorder is not None:
+                frame = frame.copy()
+                recorder.mark(frame)
+            self._frame = (count, frame)
+        return self._frame
+
     def state(self):
         """Cameras ("live", "calibrating", "not connected", "starting", "stopped"), recording, areas, rotation."""
-        latest, recorder = self.cams.latest, self.cams.recorder
+        latest, recorder, pictures = self.cams.latest, self.cams.recorder, self.cams.pictures
         pair = latest[0] if latest else None
         stopped = self.cams.ident is not None and not self.cams.is_alive()
 
@@ -137,19 +208,16 @@ class Service:
                 "picture_time": pair.timestamp if pair else None,
                 "recording": None if recorder is None else "timelapse" if recorder.timelapse else "clip",
                 "recording_file": recorder.path.name if recorder else None,
+                "pictures": pictures.state() if pictures else None,
                 "areas_every_s": self.every, "rotation_deg": self.rotation, "keep_whole_pictures": self.keep}
 
     def jpeg(self):
         """The live picture as JPEG (with the recording mark), encoded once per new picture."""
-        latest, count, recorder = self.cams.latest, self.cams.count, self.cams.recorder
-        if latest is None:
+        shown = self.frame()
+        if shown is None:
             return None
-        if self._jpeg[0] != count:
-            frame = latest[1]
-            if recorder is not None:
-                frame = frame.copy()
-                recorder.mark(frame)
-            self._jpeg = (count, cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes())
+        if self._jpeg[0] != shown[0]:
+            self._jpeg = (shown[0], cv2.imencode(".jpg", shown[1], [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes())
         return self._jpeg[1]
 
     def take_picture(self):
@@ -158,7 +226,7 @@ class Service:
         if pair is None:
             print("No picture from the cameras yet")
             return None
-        path = save_pair(replace(pair, rotation=self.rotation))
+        path = save_pair(replace(pair, rotation=self.rotation))   # the rotation as set now (by hand / API)
         print(f"Picture saved: {path.parent.name}/{path.name} (side by side; next to it the original pictures "
               f"and the temperatures: {path.stem}_thermal.npy / _thermal.png / _optical.png)")
         return path
@@ -174,8 +242,24 @@ class Service:
                 cams.recorder = Recorder(timelapse, cams.latest[1].shape[1::-1])
             return None if cams.recorder is None else "timelapse" if cams.recorder.timelapse else "clip"
 
+    def record_pictures(self, every=None):
+        """Record whole pictures into recordings/<start>/ (recording.PictureRecorder): every new pair
+        (every 0) or one every `every` s; None = stop. Returns the recording's state or None."""
+        cams = self.cams
+        with cams.lock:
+            old, cams.pictures = cams.pictures, None
+        if old is not None:
+            old.stop()                                 # outside the lock: writes what is still waiting
+        if every is not None:
+            recorder = PictureRecorder(every)
+            with cams.lock:
+                cams.pictures = recorder
+        return cams.pictures.state() if cams.pictures else None
+
     def optical_settings(self):
         """The optical camera's own settings window (in the camera thread; Windows: live view pauses)."""
+        if sys.platform == "win32":
+            print("Optical camera settings window: the live view pauses until it is closed")
         self.cams.jobs.append(lambda rig: rig.optical_settings())
 
     # Areas -------------------------------------------------------------------------------------------------
@@ -280,6 +364,9 @@ class Service:
             if self.cams.recorder is not None:     # camera thread stuck (e.g. settings window open)
                 self.cams.recorder.stop()
                 self.cams.recorder = None
+            pictures, self.cams.pictures = self.cams.pictures, None
+        if pictures is not None:
+            pictures.stop()
 
 
 # HTTP API ----------------------------------------------------------------------------------------------------
@@ -298,6 +385,25 @@ def plain(value):
     if isinstance(value, Path):
         return value.name
     return value
+
+
+PAIR_META = ("timestamp", "thermal_live", "optical_live", "rotation", "thermal_time", "optical_time")
+
+
+def pair_bytes(pair):
+    """A FramePair as an uncompressed NumPy .npz (GET /api/pair)."""
+    out = io.BytesIO()
+    np.savez(out, thermal=pair.thermal, thermal_c=pair.thermal_c, optical=pair.optical,
+             meta=np.array(json.dumps(plain({k: getattr(pair, k) for k in PAIR_META}))))
+    return out.getvalue()
+
+
+def pair_from_bytes(data):
+    with np.load(io.BytesIO(data)) as z:
+        meta = json.loads(str(z["meta"]))
+        return FramePair(meta["timestamp"], z["thermal"], z["thermal_c"], z["optical"], meta["thermal_live"],
+                         meta["optical_live"], meta["rotation"],
+                         *(math.nan if meta[k] is None else meta[k] for k in ("thermal_time", "optical_time")))
 
 
 def area_summary(area):
@@ -335,6 +441,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, body=jpeg, kind="image/jpeg") if jpeg else self.reply(503, {"error": "no picture yet"})
             elif path == "/api/live.mjpg":
                 self.stream(service)
+            elif path == "/api/pair":
+                pair = service.pair()
+                self.reply(200, body=pair_bytes(pair), kind="application/octet-stream") if pair else self.reply(
+                    503, {"error": "no picture yet"})
+            elif path == "/api/log":
+                after = int(parse_qs(url.query).get("after", ["0"])[0])
+                lines = [(n, line) for n, line in list(LOG) if n > after]
+                self.reply(200, {"next": lines[-1][0] if lines else _log["count"],
+                                 "lines": [line for _, line in lines]})
             elif path == "/api/temperature":
                 query, pair = parse_qs(url.query), service.pair()
                 x, y = float(query["x"][0]), float(query["y"][0])
@@ -374,6 +489,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, {"recording": service.record(kind == "timelapse")})
             elif path == "/api/record/stop":
                 self.reply(200, {"recording": service.record(None)})
+            elif path == "/api/pictures/record":
+                self.reply(200, {"pictures": service.record_pictures(float(data.get("every_s") or 0))})
+            elif path == "/api/pictures/stop":
+                self.reply(200, {"pictures": service.record_pictures(None)})
             elif path == "/api/areas":
                 self.reply(200, area_summary(service.new_area(data["name"], np.asarray(data["corners"], float))))
             elif path == "/api/areas/record":
@@ -406,10 +525,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         shown = -1
         while not service.closing:
-            if service.cams.count == shown or service.cams.latest is None:
+            latest = service.frame()
+            if latest is None or latest[0] == shown:
                 time.sleep(0.03)
                 continue
-            shown = service.cams.count
+            shown = latest[0]
             jpeg = service.jpeg()
             self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(jpeg)
                              + jpeg + b"\r\n")
@@ -436,12 +556,136 @@ def serve(service, host=HOST, port=PORT):
     return server
 
 
+class RemoteService:
+    """A Service running on another computer, used through its HTTP API (app.py --connect): the same
+    methods as Service for the app's main, calibration and alignment windows. The state and the camera
+    PC's log are fetched twice a second, the live picture comes as the MJPEG stream; pictures taken by
+    hand are fetched whole (GET /api/pair) and stored on this computer; clips and picture recordings
+    are made and kept on the camera PC."""
+
+    remote = True
+    OFFLINE = {"thermal": "unreachable", "optical": "unreachable", "pictures_per_s": 0.0, "picture_time": None,
+               "recording": None, "recording_file": None, "pictures": None, "areas_every_s": None,
+               "rotation_deg": 0.0, "keep_whole_pictures": False}
+
+    def __init__(self, address):
+        url = urlparse(address if "://" in address else f"http://{address}")
+        self.url = f"{url.scheme}://{url.hostname}:{url.port or PORT}"
+        self.host = url.hostname
+        self._state = dict(self.OFFLINE)
+        self._frame = None                 # (number, side-by-side picture) from the stream
+        self._log_next = None              # the camera PC's log: lines after this number are new
+        self.reachable = None              # None until the first answer / failure
+        self.closing = False
+
+    def start(self):
+        for target in (self._poll, self._stream):
+            threading.Thread(target=target, daemon=True).start()
+        return self
+
+    def call(self, path, data=None, timeout=10):
+        """GET (data None) or POST (data = JSON) to the camera PC; the answer's JSON (or bytes)."""
+        request = Request(self.url + path, None if data is None else json.dumps(data).encode(),
+                          {"Content-Type": "application/json"})
+        with urlopen(request, timeout=timeout) as answer:
+            body = answer.read()
+            return json.loads(body) if answer.headers.get_content_type() == "application/json" else body
+
+    def _poll(self):
+        while not self.closing:
+            try:
+                self._state = self.call("/api/state", timeout=3)
+                if self._log_next is None:             # older lines are not shown, only from now on
+                    self._log_next = self.call("/api/log?after=1000000000", timeout=3)["next"]
+                log = self.call(f"/api/log?after={self._log_next}", timeout=3)
+                self._log_next = log["next"]
+                for line in log["lines"]:
+                    print(f"[{self.host}] {line}")
+                if not self.reachable:
+                    print(f"Connected to the camera service at {self.url}")
+                self.reachable = True
+            except (OSError, ValueError) as exc:
+                if self.reachable is not False:
+                    print(f"Camera service at {self.url} not reachable ({exc}); trying again")
+                self.reachable, self._state = False, dict(self.OFFLINE)
+            time.sleep(0.5)
+
+    def _stream(self):
+        count = 0
+        while not self.closing:
+            try:
+                with urlopen(self.url + "/api/live.mjpg", timeout=10) as stream:
+                    while not self.closing:
+                        length = None
+                        while True:                    # the part's header lines, up to the blank line
+                            line = stream.readline()
+                            if not line:
+                                raise ConnectionError("stream ended")
+                            if line.lower().startswith(b"content-length:"):
+                                length = int(line.split(b":")[1])
+                            elif not line.strip() and length is not None:    # the blank line
+                                break
+                        frame = cv2.imdecode(np.frombuffer(stream.read(length), np.uint8), cv2.IMREAD_COLOR)
+                        if frame is not None:
+                            count += 1
+                            self._frame = (count, frame)
+            except (OSError, ValueError):
+                time.sleep(2)
+
+    def state(self):
+        return dict(self._state)
+
+    def frame(self):
+        return self._frame
+
+    def pair(self):
+        """The camera PC's latest picture pair, whole (about 11 MB over the network); None if not possible."""
+        try:
+            return pair_from_bytes(self.call("/api/pair", timeout=30))
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"No picture from the camera service at {self.url} ({exc})")
+            return None
+
+    def take_picture(self):
+        """The camera PC's latest pair, stored in pictures/ on this computer. Returns the path or None."""
+        pair = self.pair()
+        if pair is None:
+            return None
+        path = save_pair(pair)
+        print(f"Picture fetched from {self.host} and saved here: {path.parent.name}/{path.name}")
+        return path
+
+    def record(self, timelapse=None):
+        try:
+            if timelapse is None:
+                return self.call("/api/record/stop", {})["recording"]
+            return self.call("/api/record", {"kind": "timelapse" if timelapse else "clip"})["recording"]
+        except (OSError, ValueError) as exc:
+            print(f"Recording on {self.host} not started / stopped ({exc})")
+
+    def record_pictures(self, every=None):
+        try:
+            if every is None:
+                return self.call("/api/pictures/stop", {})["pictures"]
+            return self.call("/api/pictures/record", {"every_s": every})["pictures"]
+        except (OSError, ValueError) as exc:
+            print(f"Picture recording on {self.host} not started / stopped ({exc})")
+
+    def optical_settings(self):
+        print(f"The optical camera's settings window opens on the camera PC only ({self.host}: key s in its app, "
+              "or qv4l2 / v4l2-ctl there)")
+
+    def close(self):
+        self.closing = True
+
+
 def main():
     parser = argparse.ArgumentParser(description="The cameras as a background service with an HTTP API.")
     parser.add_argument("--host", default=HOST, help="address to listen on; 0.0.0.0 = the whole network "
                                                      "(default: this PC only)")
     parser.add_argument("--port", type=int, default=PORT)
     args = parser.parse_args()
+    sys.stdout, sys.stderr = Tee(sys.stdout), Tee(sys.stderr)     # what is printed also goes to GET /api/log
     service = Service()
     server = serve(service, args.host, args.port)
     if server is None:

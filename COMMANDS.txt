@@ -1,0 +1,61 @@
+RAPTURE camera commands (details in README.md)
+==============================================
+Addresses below: Windows PC 192.168.10.1, Linux camera PC 192.168.10.2 (change to yours).
+Port 8765. Run everything from this folder.
+
+
+LINUX CAMERA PC
+---------------
+Cameras with the windows on this PC, reachable from the network:
+    ~/miniconda3/envs/rapture/bin/python app.py --host 0.0.0.0
+
+Cameras without any window (background service), reachable from the network:
+    ~/miniconda3/envs/rapture/bin/python camera_service.py --host 0.0.0.0
+    (Ctrl+C stops it. Run only one of the two: only one program can use the cameras.)
+
+Firewall, if Ubuntu's is on (once):
+    sudo ufw allow from 192.168.10.0/24 to any port 8765
+
+Clock sync with the AMCF PC (once, see README "Clocks"), then check:
+    chronyc tracking
+
+
+WINDOWS PC (remote control)
+---------------------------
+    python app.py --connect 192.168.10.2
+
+Recordings and clips are made and kept on the camera PC (recordings/, clips/).
+Take picture / calibration / alignment pictures are fetched and stored on Windows.
+Views saved on Windows: copy views/*.json to the camera PC.
+
+
+RECORDING WHOLE PICTURES
+------------------------
+In the app: "Record pictures" button, "every n s" field (0 = every new picture).
+
+Or from any PC with curl (use localhost on the camera PC itself):
+    start, one pair per second:
+        curl -X POST 192.168.10.2:8765/api/pictures/record -H "Content-Type: application/json" -d "{\"every_s\": 1}"
+    start, every new pair:
+        curl -X POST 192.168.10.2:8765/api/pictures/record -H "Content-Type: application/json" -d "{\"every_s\": 0}"
+    stop:
+        curl -X POST 192.168.10.2:8765/api/pictures/stop
+    state (saved / dropped):
+        curl 192.168.10.2:8765/api/state
+
+Live view in a browser:  http://192.168.10.2:8765/api/live.mjpg
+All API calls:           http://192.168.10.2:8765/api
+
+
+AFTERWARDS: PLATE ANGLE FROM AMCF
+---------------------------------
+AMCF log = CSV with a time column (unix s / ms / ISO) and an angle column.
+    check how many pictures get an angle:
+        python recording.py recordings/<start> --angles amcf_log.csv
+    put them into all areas:
+        python recording.py recordings/<start> --angles amcf_log.csv --areas
+    angle in 1/100 deg:          add  --angle-scale 0.01
+    column names not found:      add  --time-column <name> --angle-column <name>
+    only every 5th pair:         add  --every 5
+    sign / zero of the angle:    add  --sign -1 --zero <deg>   (defaults ANGLE_SIGN / ANGLE_ZERO in recording.py)
+(On Linux use ~/miniconda3/envs/rapture/bin/python instead of python.)

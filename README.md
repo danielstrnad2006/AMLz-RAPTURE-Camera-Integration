@@ -233,6 +233,7 @@ that moment.
 | `area_history.py` | Areas and their history |
 | `defect_detection.py` | Monitored areas from a sliced 3MF job |
 | `recording.py` | Continuous recording of whole pictures; putting them into the areas with AMCF angles |
+| `link_test.py` | Signal tests through the slipring: the USB extender link, or Ethernet strands between two network ports (Linux); results in `linktest/` |
 | `capture_dual_video.py` | Clip and timelapse recording |
 | `views/` | The camera views in use (`thermal.json`, `optical.json`) |
 | `pictures/`, `calibration/`, `areas/`, `clips/`, `recordings/` | What the program saves (not in git) |

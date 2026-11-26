@@ -250,8 +250,7 @@ class Thermal(otc.IRImagerClient if otc else object):
         super().__init__()
         self.connected = False
         self._lock = threading.Lock()
-        self._event = None
-        self._time = math.nan                       # time.time() when the latest frame arrived
+        self._latest = None                         # (false-colour picture, deg C, time.time() it arrived)
         self._imager = otc.IRImagerFactory.getInstance().create("native")
         self._imager.addClient(self)
         try:
@@ -266,10 +265,26 @@ class Thermal(otc.IRImagerClient if otc else object):
         print(f"Thermal camera: {otc.deviceTypeToString(self._imager.getDeviceType())} "
               f"(S/N {self._imager.getSerialNumber()})")
 
-    def onFrame(self, evt):                         # called by the SDK for every new frame
+    def onFrame(self, evt):                         # called by the SDK (its thread) for every new frame
+        # Converted at once, nothing of the SDK's is kept: the SDK reuses evt once this returns, and the
+        # copies evt.clone() makes are never freed by the Python binding (not owned by Python: the memory
+        # grew until the program crashed, seen on Linux 2026-11-26).
+        arrived = time.time()
+        frame = evt.thermalFrame
+        if frame.isEmpty():
+            return
+        self._builder.setThermalFrame(thermalFrame=frame)
+        self._builder.convertTemperatureToPaletteImage()
+        h, w = self._builder.getHeight(), self._builder.getWidth()
+        image = np.empty((h, w, 3), np.uint8)
+        self._builder.copyImageDataTo(image)
+        temps = np.empty(h * w, np.float32)
+        frame.copyTemperaturesTo(temps)
+        temps = temps.reshape(h, w)
+        if "initializing" in otc.flagStateToString(evt.meta.getFlagState()).lower():
+            temps[:] = np.nan                       # start-up calibration: temperatures unreliable
         with self._lock:
-            self._event = evt.clone()               # the SDK reuses evt once this returns
-            self._time = time.time()
+            self._latest = (image, temps, arrived)
 
     def onConnection(self, evt):                    # called by the SDK when the connection changes
         if evt.state == otc.ConnectionState_Lost or evt.state == otc.ConnectionState_Timeout:
@@ -280,20 +295,11 @@ class Thermal(otc.IRImagerClient if otc else object):
         """Latest frame as (false-colour BGR picture, temperatures in deg C, time.time() it arrived), or
         (None, None, NaN)."""
         with self._lock:
-            event, arrived = self._event, self._time
-        if not self.connected or event is None or event.thermalFrame.isEmpty():
+            latest = self._latest
+        if not self.connected or latest is None:
             return None, None, math.nan
-        self._builder.setThermalFrame(thermalFrame=event.thermalFrame)
-        self._builder.convertTemperatureToPaletteImage()
-        h, w = self._builder.getHeight(), self._builder.getWidth()
-        image = np.empty((h, w, 3), np.uint8)
-        self._builder.copyImageDataTo(image)
-        temps = np.empty(h * w, np.float32)
-        event.thermalFrame.copyTemperaturesTo(temps)
-        temps = temps.reshape(h, w)
-        if "initializing" in otc.flagStateToString(event.meta.getFlagState()).lower():
-            temps[:] = np.nan                       # start-up calibration: temperatures unreliable
-        return image, temps, arrived
+        image, temps, arrived = latest
+        return image.copy(), temps.copy(), arrived  # the same frame may be read twice: each pair its own
 
     def close(self):
         self.connected = False

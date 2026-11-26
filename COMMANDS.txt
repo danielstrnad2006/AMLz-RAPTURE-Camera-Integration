@@ -59,3 +59,15 @@ AMCF log = CSV with a time column (unix s / ms / ISO) and an angle column.
     only every 5th pair:         add  --every 5
     sign / zero of the angle:    add  --sign -1 --zero <deg>   (defaults ANGLE_SIGN / ANGLE_ZERO in recording.py)
 (On Linux use ~/miniconda3/envs/rapture/bin/python instead of python.)
+
+
+SLIPRING LINK TESTS (link_test.py, results in linktest/)
+-----------------------------------------------------------
+USB through the Lindy extenders (camera on the far unit):
+    python link_test.py                     (add --size 800x600 for a low data rate, --no-camera for USB only)
+Ethernet strands: PC port -> ring -> USB-Ethernet adapter in the same Linux PC:
+    sudo python3 link_test.py --net                             list the ports
+    sudo python3 link_test.py --net <pc port> <usb port>        test both ways (1000 Mbit/s: all 4 pairs)
+    sudo python3 link_test.py --net <pc port> <usb port> --speed 100     only pairs 1-2 and 3-6
+    sudo python3 link_test.py --net <pc port> <usb port> --cable-test    ports' own per-pair test first
+Type the ring angle + Enter while it runs to mark the CSV. Ctrl+C ends with a summary.
